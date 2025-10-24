@@ -1,12 +1,17 @@
-"""Redis storage layer for WebSocket connections, client data, and topics."""
+"""Redis repository for WebSocket connections, client data, and topics. With fallback storage and health monitoring."""
+
 from __future__ import annotations
 
 import json
 import logging
-import time
-from collections import defaultdict
-from typing import Any, Dict, List, Optional, Set
 import os
+import time
+from dataclasses import dataclass
+from typing import Any, Callable
+
+import redis
+
+from collections import defaultdict
 from uuid import UUID
 
 import redis
@@ -19,7 +24,179 @@ logger = logging.getLogger(__name__)
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_DB = int(os.getenv("REDIS_DB", "0"))
-REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
+
+
+class RedisStoreError(Exception):
+    """Base class for Redis repository errors."""
+
+
+class RedisOperationError(RedisStoreError):
+    """Raised when a Redis command fails despite Redis being available."""
+
+
+class RedisUnavailableError(RedisStoreError):
+    """Raised when Redis is unavailable and the fallback store was used."""
+
+    def __init__(self, message: str, fallback_result: Any = None):
+        super().__init__(message)
+        self.fallback_result = fallback_result
+
+
+@dataclass
+class TopicData:
+    """Container for topic metadata used by the fallback store."""
+
+    id: str
+    creator: str
+    metadata: dict[str, Any]
+
+
+class InMemoryFallbackStore:
+    """Simple in-memory data store that mirrors Redis operations."""
+
+    def __init__(self) -> None:
+        self.clients: dict[str, dict[str, Any]] = {}
+        self.tokens: dict[str, str] = {}
+        self.client_metadata: dict[str, dict[str, Any]] = {}
+        self.connected_clients: dict[str, str] = {}
+        self.topics: dict[str, TopicData] = {}
+        self.topic_subscribers: dict[str, set[str]] = {}
+        self.client_topics: dict[str, set[str]] = {}
+
+    # Client management -------------------------------------------------
+    def register_client(self, client_uuid: str, client_name: str, token: str) -> bool:
+        self.clients[client_uuid] = {
+            "uuid": client_uuid,
+            "name": client_name,
+            "token": token,
+        }
+        if token:
+            self.tokens[token] = client_uuid
+        return True
+
+    def get_client_by_uuid(self, client_uuid: str) -> dict[str, Any] | None:
+        data = self.clients.get(client_uuid)
+        return dict(data) if data else None
+
+    def get_client_by_token(self, token: str) -> str | None:
+        return self.tokens.get(token)
+
+    def update_client_metadata(self, client_uuid: str, metadata: dict[str, Any]) -> bool:
+        self.client_metadata[client_uuid] = dict(metadata)
+        return True
+
+    def get_client_metadata(self, client_uuid: str) -> dict[str, Any] | None:
+        metadata = self.client_metadata.get(client_uuid)
+        return dict(metadata) if metadata is not None else None
+
+    # Connection state --------------------------------------------------
+    def set_client_connected(self, client_uuid: str, client_name: str) -> bool:
+        self.connected_clients[client_uuid] = client_name
+        return True
+
+    def set_client_disconnected(self, client_uuid: str) -> bool:
+        self.connected_clients.pop(client_uuid, None)
+        return True
+
+    def get_connected_clients(self) -> dict[str, str]:
+        return dict(self.connected_clients)
+
+    def is_client_connected(self, client_uuid: str) -> bool:
+        return client_uuid in self.connected_clients
+
+    # Topic management --------------------------------------------------
+    def create_topic(
+        self, topic_id: str, creator_uuid: str, metadata: dict[str, Any] | None = None
+    ) -> bool:
+        if topic_id in self.topics:
+            return False
+        self.topics[topic_id] = TopicData(
+            id=topic_id,
+            creator=creator_uuid,
+            metadata=dict(metadata or {}),
+        )
+        self.topic_subscribers.setdefault(topic_id, set())
+        return True
+
+    def get_topic(self, topic_id: str) -> dict[str, Any] | None:
+        topic = self.topics.get(topic_id)
+        if not topic:
+            return None
+        return {
+            "id": topic.id,
+            "creator": topic.creator,
+            "metadata": dict(topic.metadata),
+        }
+
+    def list_topics(self) -> list[str]:
+        return list(self.topics.keys())
+
+    def delete_topic(self, topic_id: str) -> bool:
+        if topic_id not in self.topics:
+            return False
+        del self.topics[topic_id]
+        self.topic_subscribers.pop(topic_id, None)
+        for topics in self.client_topics.values():
+            topics.discard(topic_id)
+        return True
+
+    def subscribe_to_topic(self, topic_id: str, client_uuid: str) -> bool:
+        if topic_id not in self.topics:
+            return False
+        subscribers = self.topic_subscribers.setdefault(topic_id, set())
+        subscribers.add(client_uuid)
+        self.client_topics.setdefault(client_uuid, set()).add(topic_id)
+        return True
+
+    def unsubscribe_from_topic(self, topic_id: str, client_uuid: str) -> bool:
+        subscribers = self.topic_subscribers.get(topic_id)
+        if not subscribers:
+            return False
+        subscribers.discard(client_uuid)
+        if client_uuid in self.client_topics:
+            self.client_topics[client_uuid].discard(topic_id)
+        return True
+
+    def get_topic_subscribers(self, topic_id: str) -> set[str]:
+        return set(self.topic_subscribers.get(topic_id, set()))
+
+    def get_client_topics(self, client_uuid: str) -> set[str]:
+        return set(self.client_topics.get(client_uuid, set()))
+
+    # Cleanup -----------------------------------------------------------
+    def cleanup_client(self, client_uuid: str) -> bool:
+        topics = list(self.client_topics.get(client_uuid, set()))
+        for topic_id in topics:
+            self.unsubscribe_from_topic(topic_id, client_uuid)
+        self.set_client_disconnected(client_uuid)
+        self.client_metadata.pop(client_uuid, None)
+        return True
+
+    # Snapshot ----------------------------------------------------------
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "clients": {uuid: dict(data) for uuid, data in self.clients.items()},
+            "tokens": dict(self.tokens),
+            "client_metadata": {uuid: dict(meta) for uuid, meta in self.client_metadata.items()},
+            "connected_clients": dict(self.connected_clients),
+            "topics": {
+                topic_id: {
+                    "id": topic.id,
+                    "creator": topic.creator,
+                    "metadata": dict(topic.metadata),
+                }
+                for topic_id, topic in self.topics.items()
+            },
+            "topic_subscribers": {
+                topic_id: list(subscribers)
+                for topic_id, subscribers in self.topic_subscribers.items()
+            },
+            "client_topics": {
+                client_uuid: list(topics)
+                for client_uuid, topics in self.client_topics.items()
+            },
+        }
 
 _settings = get_settings()
 TOKEN_META_PREFIX = f"{_settings.redis_token_prefix}_meta"
@@ -27,150 +204,217 @@ CLIENT_TOKEN_SET_PREFIX = "client_tokens"
 
 
 class RedisStore:
-    """Redis storage for client data, tokens, and topics."""
-    
-    def __init__(self):
-        """Initialize Redis connection."""
+    """Redis repository with retry logic, circuit breaking, and fallback support."""
+
+    def __init__(self) -> None:
+        self._client: redis.Redis | None = None
+        self._max_retries = int(os.getenv("REDIS_MAX_RETRIES", "3"))
+        self._retry_backoff = float(os.getenv("REDIS_RETRY_BACKOFF", "0.2"))
+        self._health_check_interval = float(os.getenv("REDIS_HEALTH_INTERVAL", "5"))
+        self._last_health_check = 0.0
+        self._circuit_open = False
+        self._backfill_needed = False
+        self.fallback = InMemoryFallbackStore()
+
+        self._connect(initial=True)
+
+    # Connection management --------------------------------------------
+    def _build_client(self) -> redis.Redis:
+        return redis.Redis(
+            host=REDIS_HOST,
+            port=REDIS_PORT,
+            db=REDIS_DB,
+            password=REDIS_PASSWORD,
+            decode_responses=True,
+        )
+
+    def _connect(self, *, initial: bool = False) -> None:
         try:
-            self.client = redis.Redis(
-                host=REDIS_HOST,
-                port=REDIS_PORT,
-                db=REDIS_DB,
-                password=REDIS_PASSWORD,
-                decode_responses=True,
+            client = self._build_client()
+            client.ping()
+        except redis.exceptions.RedisError as exc:
+            if initial:
+                logger.warning(
+                    "Redis connection failed on startup: %s. Entering fallback mode.",
+                    exc,
+                )
+            else:
+                logger.debug("Redis connection attempt failed: %s", exc)
+            self._client = None
+            self._circuit_open = True
+            self._last_health_check = time.monotonic()
+            return
+
+        self._client = client
+        self._circuit_open = False
+        logger.info("Redis connected: %s:%s", REDIS_HOST, REDIS_PORT)
+        if self._backfill_needed:
+            self._backfill_from_fallback()
+
+    def _ensure_connection(self) -> bool:
+        if self._client and not self._circuit_open:
+            return True
+
+        now = time.monotonic()
+        if now - self._last_health_check < self._health_check_interval:
+            return False
+
+        self._last_health_check = now
+        self._connect()
+        return bool(self._client)
+
+    def check_health(self) -> dict[str, Any]:
+        """Return health information and attempt to close the circuit when possible."""
+        available = self._ensure_connection()
+        status = "available" if available else "degraded"
+        return {
+            "status": status,
+            "redis": bool(self._client),
+            "fallback_in_use": not available,
+            "backfill_pending": self._backfill_needed,
+        }
+
+    def _execute(self, operation: Callable[[], Any], *, description: str) -> Any:
+        if not self._ensure_connection():
+            raise RedisUnavailableError(
+                f"Redis unavailable during {description}; using fallback store instead."
             )
-            # Test connection
-            self.client.ping()
-            logger.info(f"Redis connected: {REDIS_HOST}:{REDIS_PORT}")
-        except redis.ConnectionError as e:
-            logger.warning(f"Redis connection failed: {e}. Using in-memory fallback.")
-            self.client = None
 
-        # In-memory fallbacks for environments without Redis
-        self._offline_queues: dict[str, list[dict]] = defaultdict(list)
-        self._delivery_status: dict[str, dict[str, Any]] = {}
-        self._recipient_index: dict[str, set[str]] = defaultdict(set)
-        self._sender_index: dict[str, set[str]] = defaultdict(set)
-        # Fallback storage when Redis is unavailable
-        self.fallback_tokens: dict[str, dict[str, str]] = {}
-        self.fallback_token_lookup: dict[str, str] = {}
-        self.fallback_clients: dict[str, dict[str, str]] = {}
-        self.fallback_topic_subscribers: dict[str, set[str]] = {}
-        self.fallback_client_topics: dict[str, set[str]] = {}
-    
-    # Client Management
-    
-    def register_client(self, client_uuid: str, client_name: str, last_token_jti: Optional[str] = None) -> bool:
-        """
-        Register a client with their token.
+        last_error: BaseException | None = None
+        for attempt in range(1, self._max_retries + 1):
+            try:
+                return operation()
+            except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError) as exc:
+                last_error = exc
+                logger.warning(
+                    "Redis %s failed on attempt %s/%s: %s", description, attempt, self._max_retries, exc
+                )
+                time.sleep(self._retry_backoff * attempt)
+                self._client = None
+                self._circuit_open = True
+                self._last_health_check = time.monotonic()
+                self._ensure_connection()
+            except redis.exceptions.RedisError as exc:
+                logger.error("Redis %s failed with error: %s", description, exc)
+                raise RedisOperationError(f"Redis {description} failed: {exc}") from exc
 
-        Args:
-            client_uuid: Client's UUID
-            client_name: Client's name
-            last_token_jti: Last issued access token identifier
+        raise RedisUnavailableError(
+            f"Redis unavailable during {description}; using fallback store instead."
+        ) from last_error
 
-        Returns:
-            True if successful
-        """
-        if not self.client:
-            self.fallback_clients[client_uuid] = {
-                "uuid": client_uuid,
-                "name": client_name,
-                "last_token_jti": last_token_jti or "",
-            }
-            return True
+    def _backfill_from_fallback(self) -> None:
+        if not self._client or not self._backfill_needed:
+            return
 
-        try:
-            client_key = f"client:{client_uuid}"
-            client_data = {
-                "uuid": client_uuid,
-                "name": client_name,
-            }
-            if last_token_jti:
-                client_data["last_token_jti"] = last_token_jti
+        snapshot = self.fallback.snapshot()
+        pipe = self._client.pipeline()
 
-            self.client.hset(client_key, mapping=client_data)
+        # Clients
+        for client_uuid, client_data in snapshot["clients"].items():
+            pipe.hset(f"client:{client_uuid}", mapping=client_data)
 
-            logger.info(f"Client registered in Redis: {client_name} ({client_uuid})")
-            return True
-        except Exception as e:
-            logger.error(f"Error registering client in Redis: {e}")
-            return False
-    
-    def get_client_by_uuid(self, client_uuid: str) -> Optional[Dict]:
-        """
-        Get client data by UUID.
-        
-        Args:
-            client_uuid: Client's UUID
-            
-        Returns:
-            Client data dict or None
-        """
-        if not self.client:
-            return self.fallback_clients.get(client_uuid)
+        # Tokens
+        for token, client_uuid in snapshot["tokens"].items():
+            pipe.setex(f"token:{token}", 3600, client_uuid)
 
-        try:
-            client_key = f"client:{client_uuid}"
-            data = self.client.hgetall(client_key)
-            return data if data else None
-        except Exception as e:
-            logger.error(f"Error getting client from Redis: {e}")
-            return None
-    
-    def get_client_by_token(self, token: str) -> Optional[str]:
-        """
-        Get client UUID by token.
-        
-        Args:
-            token: JWT token
-            
-        Returns:
-            Client UUID or None
-        """
-        if not self.client:
-            jti = self.fallback_token_lookup.get(token)
-            if not jti:
-                return None
-            record = self.fallback_tokens.get(jti)
-            if not record:
-                self.fallback_token_lookup.pop(token, None)
-                return None
-            if record["expires_at"] <= time.time():
-                self.fallback_token_lookup.pop(token, None)
-                self.fallback_tokens.pop(jti, None)
-                return None
-            return record.get("client_uuid")
+        # Metadata
+        for client_uuid, metadata in snapshot["client_metadata"].items():
+            pipe.set(f"client:{client_uuid}:metadata", json.dumps(metadata))
+
+        # Connected clients
+        if snapshot["connected_clients"]:
+            pipe.delete("connected_clients")
+            pipe.hset("connected_clients", mapping=snapshot["connected_clients"])
+
+        # Topics
+        if snapshot["topics"]:
+            pipe.delete("topics")
+            pipe.sadd("topics", *snapshot["topics"].keys())
+
+        for topic_id, topic_data in snapshot["topics"].items():
+            pipe.hset(f"topic:{topic_id}", mapping={
+                "id": topic_data["id"],
+                "creator": topic_data["creator"],
+                "metadata": json.dumps(topic_data.get("metadata", {})),
+            })
+
+        for topic_id, subscribers in snapshot["topic_subscribers"].items():
+            if subscribers:
+                pipe.delete(f"topic:{topic_id}:subscribers")
+                pipe.sadd(f"topic:{topic_id}:subscribers", *subscribers)
+
+        for client_uuid, topics in snapshot["client_topics"].items():
+            if topics:
+                pipe.delete(f"client:{client_uuid}:topics")
+                pipe.sadd(f"client:{client_uuid}:topics", *topics)
+
+        pipe.execute()
+        self._backfill_needed = False
+        logger.info("Redis backfilled from fallback store")
+
+    # Repository methods -----------------------------------------------
+    def register_client(self, client_uuid: str, client_name: str, token: str) -> bool:
+        self.fallback.register_client(client_uuid, client_name, token)
 
         try:
-            token_key = f"token:{token}"
-            return self.client.get(token_key)
-        except Exception as e:
-            logger.error(f"Error getting client by token: {e}")
-            return None
-    
-    def update_client_metadata(self, client_uuid: str, metadata: Dict) -> bool:
-        """
-        Update client metadata.
-        
-        Args:
-            client_uuid: Client's UUID
-            metadata: Metadata dictionary
-            
-        Returns:
-            True if successful
-        """
-        if not self.client:
-            self.fallback_clients.setdefault(client_uuid, {"uuid": client_uuid}).update({"metadata": metadata})
-            return True
+            def op() -> bool:
+                pipe = self._client.pipeline()
+                pipe.hset(
+                    f"client:{client_uuid}",
+                    mapping={"uuid": client_uuid, "name": client_name, "token": token},
+                )
+                pipe.setex(f"token:{token}", 3600, client_uuid)
+                pipe.execute()
+                return True
 
-        try:
-            metadata_key = f"client:{client_uuid}:metadata"
-            self.client.set(metadata_key, json.dumps(metadata))
+            self._execute(op, description="register_client")
             return True
-        except Exception as e:
-            logger.error(f"Error updating client metadata: {e}")
-            return False
+        except RedisUnavailableError as exc:
+            self._backfill_needed = True
+            raise RedisUnavailableError(exc.args[0], fallback_result=True) from exc
+
+    def get_client_by_uuid(self, client_uuid: str) -> dict[str, Any] | None:
+        fallback_value = self.fallback.get_client_by_uuid(client_uuid)
+        try:
+            def op() -> dict[str, Any] | None:
+                data = self._client.hgetall(f"client:{client_uuid}")
+                return data or None
+
+            result = self._execute(op, description="get_client_by_uuid")
+            if result:
+                token = result.get("token", "")
+                self.fallback.register_client(client_uuid, result.get("name", ""), token)
+            return result
+        except RedisUnavailableError as exc:
+            raise RedisUnavailableError(exc.args[0], fallback_result=fallback_value) from exc
+
+    def get_client_by_token(self, token: str) -> str | None:
+        fallback_value = self.fallback.get_client_by_token(token)
+        try:
+            def op() -> str | None:
+                return self._client.get(f"token:{token}")
+
+            result = self._execute(op, description="get_client_by_token")
+            if result:
+                client = self.get_client_by_uuid(result)
+                if client:
+                    self.fallback.register_client(result, client.get("name", ""), token)
+            return result
+        except RedisUnavailableError as exc:
+            raise RedisUnavailableError(exc.args[0], fallback_result=fallback_value) from exc
+
+    def update_client_metadata(self, client_uuid: str, metadata: dict[str, Any]) -> bool:
+        self.fallback.update_client_metadata(client_uuid, metadata)
+        try:
+            def op() -> bool:
+                self._client.set(f"client:{client_uuid}:metadata", json.dumps(metadata))
+                return True
+
+            self._execute(op, description="update_client_metadata")
+            return True
+        except RedisUnavailableError as exc:
+            self._backfill_needed = True
+            raise RedisUnavailableError(exc.args[0], fallback_result=True) from exc
     
     def get_client_metadata(self, client_uuid: str) -> Optional[Dict]:
         """
@@ -187,667 +431,205 @@ class RedisStore:
             return metadata
 
         try:
-            metadata_key = f"client:{client_uuid}:metadata"
-            data = self.client.get(metadata_key)
-            return json.loads(data) if data else None
-        except Exception as e:
-            logger.error(f"Error getting client metadata: {e}")
-            return None
-    
-    # Connection State Management
-    
+            def op() -> dict[str, Any] | None:
+                data = self._client.get(f"client:{client_uuid}:metadata")
+                return json.loads(data) if data else None
+
+            return self._execute(op, description="get_client_metadata")
+        except RedisUnavailableError as exc:
+            raise RedisUnavailableError(exc.args[0], fallback_result=fallback_value) from exc
+
     def set_client_connected(self, client_uuid: str, client_name: str) -> bool:
-        """
-        Mark a client as connected.
-        
-        Args:
-            client_uuid: Client's UUID
-            client_name: Client's name
-            
-        Returns:
-            True if successful
-        """
-        if not self.client:
-            entry = self.fallback_clients.setdefault(client_uuid, {"uuid": client_uuid})
-            entry["name"] = client_name
-            entry["connected"] = True
-            return True
-
+        self.fallback.set_client_connected(client_uuid, client_name)
         try:
-            self.client.hset("connected_clients", client_uuid, client_name)
-            logger.info(f"Client marked connected: {client_name} ({client_uuid})")
-            return True
-        except Exception as e:
-            logger.error(f"Error marking client connected: {e}")
-            return False
-    
-    def set_client_disconnected(self, client_uuid: str) -> bool:
-        """
-        Mark a client as disconnected.
-        
-        Args:
-            client_uuid: Client's UUID
-            
-        Returns:
-            True if successful
-        """
-        if not self.client:
-            if client_uuid in self.fallback_clients:
-                self.fallback_clients[client_uuid]["connected"] = False
+            def op() -> bool:
+                self._client.hset("connected_clients", client_uuid, client_name)
                 return True
-            return False
 
-        try:
-            self.client.hdel("connected_clients", client_uuid)
-            logger.info(f"Client marked disconnected: {client_uuid}")
+            self._execute(op, description="set_client_connected")
             return True
-        except Exception as e:
-            logger.error(f"Error marking client disconnected: {e}")
-            return False
-    
-    def get_connected_clients(self) -> Dict[str, str]:
-        """
-        Get all connected clients.
-        
-        Returns:
-            Dictionary mapping UUID to client name
-        """
-        if not self.client:
-            return {
-                client_uuid: data.get("name", "Unknown")
-                for client_uuid, data in self.fallback_clients.items()
-                if data.get("connected")
-            }
+        except RedisUnavailableError as exc:
+            self._backfill_needed = True
+            raise RedisUnavailableError(exc.args[0], fallback_result=True) from exc
 
+    def set_client_disconnected(self, client_uuid: str) -> bool:
+        self.fallback.set_client_disconnected(client_uuid)
         try:
-            return self.client.hgetall("connected_clients")
-        except Exception as e:
-            logger.error(f"Error getting connected clients: {e}")
-            return {}
-    
+            def op() -> bool:
+                self._client.hdel("connected_clients", client_uuid)
+                return True
+
+            self._execute(op, description="set_client_disconnected")
+            return True
+        except RedisUnavailableError as exc:
+            self._backfill_needed = True
+            raise RedisUnavailableError(exc.args[0], fallback_result=True) from exc
+
+    def get_connected_clients(self) -> dict[str, str]:
+        fallback_value = self.fallback.get_connected_clients()
+        try:
+            def op() -> dict[str, str]:
+                return self._client.hgetall("connected_clients")
+
+            return self._execute(op, description="get_connected_clients")
+        except RedisUnavailableError as exc:
+            raise RedisUnavailableError(exc.args[0], fallback_result=fallback_value) from exc
+
     def is_client_connected(self, client_uuid: str) -> bool:
-        """
-        Check if a client is connected.
-
-        Args:
-            client_uuid: Client's UUID
-
-        Returns:
-            True if connected
-        """
-        if not self.client:
-            return self.fallback_clients.get(client_uuid, {}).get("connected", False)
-
+        fallback_value = self.fallback.is_client_connected(client_uuid)
         try:
-            return self.client.hexists("connected_clients", client_uuid)
-        except Exception as e:
-            logger.error(f"Error checking client connection: {e}")
+            def op() -> bool:
+                return bool(self._client.hexists("connected_clients", client_uuid))
+
+            return bool(self._execute(op, description="is_client_connected"))
+        except RedisUnavailableError as exc:
+            raise RedisUnavailableError(exc.args[0], fallback_result=fallback_value) from exc
+
+    def create_topic(
+        self, topic_id: str, creator_uuid: str, metadata: dict[str, Any] | None = None
+    ) -> bool:
+        created = self.fallback.create_topic(topic_id, creator_uuid, metadata)
+        if not created:
             return False
+        try:
+            def op() -> bool:
+                topic_key = f"topic:{topic_id}"
+                pipe = self._client.pipeline()
+                pipe.hset(
+                    topic_key,
+                    mapping={
+                        "id": topic_id,
+                        "creator": creator_uuid,
+                        "metadata": json.dumps(metadata or {}),
+                    },
+                )
+                pipe.sadd("topics", topic_id)
+                pipe.execute()
+                return True
 
-    # Message Queue and Delivery Tracking
-
-    def enqueue_offline_message(self, recipient_uuid: str, message: Dict) -> bool:
-        """Persist a message for an offline recipient."""
-        if not message:
-            return False
-
-        if not self.client:
-            self._offline_queues[recipient_uuid].append(message.copy())
+            self._execute(op, description="create_topic")
             return True
+        except RedisUnavailableError as exc:
+            self._backfill_needed = True
+            raise RedisUnavailableError(exc.args[0], fallback_result=True) from exc
 
+    def get_topic(self, topic_id: str) -> dict[str, Any] | None:
+        fallback_value = self.fallback.get_topic(topic_id)
         try:
-            queue_key = f"offline:{recipient_uuid}"
-            self.client.rpush(queue_key, json.dumps(message))
-            return True
-        except Exception as e:
-            logger.error(f"Error queueing offline message: {e}")
-            return False
+            def op() -> dict[str, Any] | None:
+                topic_key = f"topic:{topic_id}"
+                data = self._client.hgetall(topic_key)
+                if data and "metadata" in data:
+                    data["metadata"] = json.loads(data["metadata"])
+                return data or None
 
-    def pop_offline_messages(self, recipient_uuid: str) -> List[Dict]:
-        """Retrieve and remove queued messages for a recipient."""
-        if not self.client:
-            messages = self._offline_queues.pop(recipient_uuid, [])
-            return [msg.copy() for msg in messages]
+            return self._execute(op, description="get_topic")
+        except RedisUnavailableError as exc:
+            raise RedisUnavailableError(exc.args[0], fallback_result=fallback_value) from exc
 
-        queue_key = f"offline:{recipient_uuid}"
+    def list_topics(self) -> list[str]:
+        fallback_value = self.fallback.list_topics()
         try:
-            messages = self.client.lrange(queue_key, 0, -1)
-            if messages:
-                self.client.delete(queue_key)
-            return [json.loads(item) for item in messages]
-        except Exception as e:
-            logger.error(f"Error retrieving offline messages: {e}")
-            return []
+            def op() -> list[str]:
+                topics = self._client.smembers("topics")
+                return list(topics) if topics else []
 
-    def record_delivery_attempt(self, msgid: str, metadata: Dict[str, Any]) -> None:
-        """Record metadata for a delivery attempt."""
-        metadata = metadata.copy()
-        metadata.setdefault("msgid", msgid)
-        metadata.setdefault("attempts", 0)
-        metadata.setdefault("status", "created")
-        metadata.setdefault("last_update", time.time())
+            return self._execute(op, description="list_topics")
+        except RedisUnavailableError as exc:
+            raise RedisUnavailableError(exc.args[0], fallback_result=fallback_value) from exc
 
-        if not self.client:
-            self._delivery_status[msgid] = metadata
-            recipient = metadata.get("recipient")
-            sender = metadata.get("sender")
-            if recipient:
-                self._recipient_index[recipient].add(msgid)
-            if sender:
-                self._sender_index[sender].add(msgid)
-            return
-
-        key = f"delivery:{msgid}"
-        try:
-            self.client.hset(key, mapping={k: json.dumps(v) if isinstance(v, (dict, list)) else v for k, v in metadata.items()})
-            recipient = metadata.get("recipient")
-            sender = metadata.get("sender")
-            if recipient:
-                self.client.sadd(f"recipient:{recipient}:messages", msgid)
-            if sender:
-                self.client.sadd(f"sender:{sender}:messages", msgid)
-        except Exception as e:
-            logger.error(f"Error recording delivery attempt: {e}")
-
-    def update_delivery_status(self, msgid: str, status: str, **fields: Any) -> None:
-        """Update the status and metadata of a delivery."""
-        update = {"status": status, "last_update": time.time()}
-        update.update(fields)
-
-        if not self.client:
-            current = self._delivery_status.get(msgid, {})
-            current.update(update)
-            self._delivery_status[msgid] = current
-            if status in {"delivered", "failed"}:
-                recipient = current.get("recipient")
-                if recipient and msgid in self._recipient_index.get(recipient, set()):
-                    self._recipient_index[recipient].discard(msgid)
-            return
-
-        key = f"delivery:{msgid}"
-        try:
-            mapping = {k: json.dumps(v) if isinstance(v, (dict, list)) else v for k, v in update.items()}
-            self.client.hset(key, mapping=mapping)
-
-            if status in {"delivered", "failed"}:
-                data = self.client.hgetall(key)
-                recipient = data.get("recipient")
-                if recipient:
-                    self.client.srem(f"recipient:{recipient}:messages", msgid)
-        except Exception as e:
-            logger.error(f"Error updating delivery status: {e}")
-
-    def get_delivery_status(self, msgid: str) -> Optional[Dict[str, Any]]:
-        """Fetch delivery metadata for a message."""
-        if not self.client:
-            record = self._delivery_status.get(msgid)
-            return record.copy() if record else None
-
-        key = f"delivery:{msgid}"
-        try:
-            data = self.client.hgetall(key)
-            if not data:
-                return None
-            result: Dict[str, Any] = {}
-            for k, v in data.items():
-                try:
-                    result[k] = json.loads(v)
-                except (TypeError, json.JSONDecodeError):
-                    result[k] = v
-            return result
-        except Exception as e:
-            logger.error(f"Error retrieving delivery status: {e}")
-            return None
-
-    def list_undelivered_messages(self, client_uuid: str) -> List[Dict[str, Any]]:
-        """List delivery records that are not yet completed for a client."""
-        messages: List[Dict[str, Any]] = []
-
-        if not self.client:
-            msgids = list(self._recipient_index.get(client_uuid, set()))
-            for msgid in msgids:
-                record = self._delivery_status.get(msgid)
-                if record and record.get("status") not in {"delivered", "failed"}:
-                    messages.append(record.copy())
-            return messages
-
-        set_key = f"recipient:{client_uuid}:messages"
-        try:
-            msgids = self.client.smembers(set_key)
-            for msgid in msgids:
-                record = self.get_delivery_status(msgid)
-                if record and record.get("status") not in {"delivered", "failed"}:
-                    messages.append(record)
-            return messages
-        except Exception as e:
-            logger.error(f"Error listing undelivered messages: {e}")
-            return []
-
-    def get_delivery_metrics(self) -> Dict[str, int]:
-        """Aggregate delivery metrics for monitoring."""
-        metrics = {"total": 0, "delivered": 0, "pending": 0, "queued": 0, "failed": 0}
-
-        if not self.client:
-            for record in self._delivery_status.values():
-                metrics["total"] += 1
-                status = record.get("status", "pending")
-                if status in {"delivered", "failed", "queued", "pending", "pending_ack", "retrying"}:
-                    if status == "delivered":
-                        metrics["delivered"] += 1
-                    elif status == "failed":
-                        metrics["failed"] += 1
-                    elif status in {"queued", "queued_offline"}:
-                        metrics["queued"] += 1
-                    else:
-                        metrics["pending"] += 1
-                else:
-                    metrics["pending"] += 1
-            return metrics
-
-        try:
-            for key in self.client.scan_iter(match="delivery:*"):
-                metrics["total"] += 1
-                record = self.get_delivery_status(key.split(":", 1)[1])
-                if not record:
-                    continue
-                status = record.get("status", "pending")
-                if status == "delivered":
-                    metrics["delivered"] += 1
-                elif status == "failed":
-                    metrics["failed"] += 1
-                elif status in {"queued", "queued_offline"}:
-                    metrics["queued"] += 1
-                else:
-                    metrics["pending"] += 1
-            return metrics
-        except Exception as e:
-            logger.error(f"Error calculating delivery metrics: {e}")
-            return metrics
-    # Token management
-
-    def store_token(self, jti: str, token: str, client_uuid: str, token_type: str, expires_in: int) -> bool:
-        """Store a token record for validation and revocation."""
-
-        if not self.client:
-            expires_at = time.time() + expires_in
-            self.fallback_tokens[jti] = {
-                "jti": jti,
-                "token": token,
-                "client_uuid": client_uuid,
-                "type": token_type,
-                "expires_at": expires_at,
-            }
-            self.fallback_token_lookup[token] = jti
-            return True
-
-        token_key = f"token:{token}"
-        meta_key = f"{TOKEN_META_PREFIX}:{jti}"
-        client_tokens_key = f"{CLIENT_TOKEN_SET_PREFIX}:{client_uuid}"
-
-        try:
-            record = {
-                "jti": jti,
-                "token": token,
-                "client_uuid": client_uuid,
-                "type": token_type,
-            }
-            pipeline = self.client.pipeline()
-            pipeline.setex(token_key, expires_in, client_uuid)
-            pipeline.hset(meta_key, mapping=record)
-            pipeline.expire(meta_key, expires_in)
-            pipeline.sadd(client_tokens_key, jti)
-            pipeline.execute()
-            return True
-        except Exception as exc:
-            logger.error("Error storing token metadata: %s", exc)
-            return False
-
-    def get_token_record(self, jti: str) -> Optional[Dict[str, str]]:
-        """Retrieve stored token metadata."""
-
-        if not self.client:
-            record = self.fallback_tokens.get(jti)
-            if not record:
-                return None
-            if record["expires_at"] <= time.time():
-                self.fallback_tokens.pop(jti, None)
-                self.fallback_token_lookup.pop(record.get("token", ""), None)
-                return None
-            return record
-
-        try:
-            meta_key = f"{TOKEN_META_PREFIX}:{jti}"
-            record = self.client.hgetall(meta_key)
-            return record if record else None
-        except Exception as exc:
-            logger.error("Error retrieving token metadata: %s", exc)
-            return None
-
-    def is_token_active(self, jti: str, token: Optional[str] = None) -> bool:
-        """Determine whether a token is still active (not revoked and not expired)."""
-
-        record = self.get_token_record(jti)
-        if not record:
-            return False
-
-        if token and record.get("token") != token:
-            logger.warning("Token mismatch for jti %s", jti)
-            return False
-
-        if not self.client:
-            if record["expires_at"] <= time.time():
-                self.fallback_tokens.pop(jti, None)
-                self.fallback_token_lookup.pop(record.get("token", ""), None)
-                return False
-            return True
-
-        # Redis manages expiry; existence of metadata indicates active token
-        return True
-
-    def revoke_token(self, jti: str) -> bool:
-        """Revoke a token by its identifier."""
-
-        if not self.client:
-            record = self.fallback_tokens.pop(jti, None)
-            if not record:
-                return False
-            token = record.get("token")
-            if token:
-                self.fallback_token_lookup.pop(token, None)
-            return True
-
-        try:
-            record = self.get_token_record(jti)
-            if not record:
-                return False
-
-            token = record.get("token")
-            client_uuid = record.get("client_uuid")
-
-            pipeline = self.client.pipeline()
-            meta_key = f"{TOKEN_META_PREFIX}:{jti}"
-            pipeline.delete(meta_key)
-            if token:
-                pipeline.delete(f"token:{token}")
-            if client_uuid:
-                pipeline.srem(f"{CLIENT_TOKEN_SET_PREFIX}:{client_uuid}", jti)
-            pipeline.execute()
-            return True
-        except Exception as exc:
-            logger.error("Error revoking token %s: %s", jti, exc)
-            return False
-
-    def revoke_client_tokens(self, client_uuid: str, token_type: Optional[str] = None) -> int:
-        """Revoke all tokens for a client, optionally filtered by token type."""
-
-        if not self.client:
-            revoked = [
-                jti
-                for jti, record in list(self.fallback_tokens.items())
-                if record.get("client_uuid") == client_uuid
-                and (not token_type or record.get("type") == token_type)
-            ]
-            for jti in revoked:
-                record = self.fallback_tokens.pop(jti, None)
-                if record and record.get("token"):
-                    self.fallback_token_lookup.pop(record["token"], None)
-            return len(revoked)
-
-        try:
-            tokens_key = f"{CLIENT_TOKEN_SET_PREFIX}:{client_uuid}"
-            jtis = self.client.smembers(tokens_key) or []
-            revoked_count = 0
-            for token_jti in jtis:
-                record = self.get_token_record(token_jti)
-                if not record:
-                    self.client.srem(tokens_key, token_jti)
-                    continue
-                if token_type and record.get("type") != token_type:
-                    continue
-                if self.revoke_token(token_jti):
-                    revoked_count += 1
-            return revoked_count
-        except Exception as exc:
-            logger.error("Error revoking tokens for client %s: %s", client_uuid, exc)
-            return 0
-    
-    # Topic/Room Management
-    
-    def create_topic(self, topic_id: str, creator_uuid: str, metadata: Optional[Dict] = None) -> bool:
-        """
-        Create a new topic/room.
-        
-        Args:
-            topic_id: Topic identifier
-            creator_uuid: UUID of the creator
-            metadata: Optional metadata dictionary
-            
-        Returns:
-            True if successful
-        """
-        if not self.client:
-            return False
-        
-        try:
-            topic_key = f"topic:{topic_id}"
-            topic_data = {
-                "id": topic_id,
-                "creator": creator_uuid,
-                "metadata": json.dumps(metadata or {})
-            }
-            self.client.hset(topic_key, mapping=topic_data)
-            
-            # Add to topics set
-            self.client.sadd("topics", topic_id)
-            
-            logger.info(f"Topic created: {topic_id} by {creator_uuid}")
-            return True
-        except Exception as e:
-            logger.error(f"Error creating topic: {e}")
-            return False
-    
-    def get_topic(self, topic_id: str) -> Optional[Dict]:
-        """
-        Get topic data.
-        
-        Args:
-            topic_id: Topic identifier
-            
-        Returns:
-            Topic data dictionary or None
-        """
-        if not self.client:
-            return None
-        
-        try:
-            topic_key = f"topic:{topic_id}"
-            data = self.client.hgetall(topic_key)
-            if data and "metadata" in data:
-                data["metadata"] = json.loads(data["metadata"])
-            return data if data else None
-        except Exception as e:
-            logger.error(f"Error getting topic: {e}")
-            return None
-    
-    def list_topics(self) -> List[str]:
-        """
-        List all available topics.
-        
-        Returns:
-            List of topic IDs
-        """
-        if not self.client:
-            return []
-        
-        try:
-            topics = self.client.smembers("topics")
-            return list(topics) if topics else []
-        except Exception as e:
-            logger.error(f"Error listing topics: {e}")
-            return []
-    
     def delete_topic(self, topic_id: str) -> bool:
-        """
-        Delete a topic.
-        
-        Args:
-            topic_id: Topic identifier
-            
-        Returns:
-            True if successful
-        """
-        if not self.client:
+        deleted = self.fallback.delete_topic(topic_id)
+        if not deleted:
             return False
-        
         try:
-            topic_key = f"topic:{topic_id}"
-            subscribers_key = f"topic:{topic_id}:subscribers"
-            
-            # Delete topic data
-            self.client.delete(topic_key)
-            # Delete subscribers
-            self.client.delete(subscribers_key)
-            # Remove from topics set
-            self.client.srem("topics", topic_id)
-            
-            logger.info(f"Topic deleted: {topic_id}")
-            return True
-        except Exception as e:
-            logger.error(f"Error deleting topic: {e}")
-            return False
-    
+            def op() -> bool:
+                pipe = self._client.pipeline()
+                pipe.delete(f"topic:{topic_id}")
+                pipe.delete(f"topic:{topic_id}:subscribers")
+                pipe.srem("topics", topic_id)
+                pipe.execute()
+                return deleted
+
+            return self._execute(op, description="delete_topic")
+        except RedisUnavailableError as exc:
+            self._backfill_needed = True
+            raise RedisUnavailableError(exc.args[0], fallback_result=deleted) from exc
+
     def subscribe_to_topic(self, topic_id: str, client_uuid: str) -> bool:
-        """
-        Subscribe a client to a topic.
-        
-        Args:
-            topic_id: Topic identifier
-            client_uuid: Client's UUID
-            
-        Returns:
-            True if successful
-        """
-        if not self.client:
-            self.fallback_topic_subscribers.setdefault(topic_id, set()).add(client_uuid)
-            self.fallback_client_topics.setdefault(client_uuid, set()).add(topic_id)
-            return True
-
-        try:
-            subscribers_key = f"topic:{topic_id}:subscribers"
-            self.client.sadd(subscribers_key, client_uuid)
-
-            # Add to client's subscriptions
-            client_topics_key = f"client:{client_uuid}:topics"
-            self.client.sadd(client_topics_key, topic_id)
-
-            logger.info(f"Client {client_uuid} subscribed to topic {topic_id}")
-            return True
-        except Exception as e:
-            logger.error(f"Error subscribing to topic: {e}")
+        subscribed = self.fallback.subscribe_to_topic(topic_id, client_uuid)
+        if not subscribed:
             return False
-    
+        try:
+            def op() -> bool:
+                pipe = self._client.pipeline()
+                pipe.sadd(f"topic:{topic_id}:subscribers", client_uuid)
+                pipe.sadd(f"client:{client_uuid}:topics", topic_id)
+                pipe.execute()
+                return subscribed
+
+            return self._execute(op, description="subscribe_to_topic")
+        except RedisUnavailableError as exc:
+            self._backfill_needed = True
+            raise RedisUnavailableError(exc.args[0], fallback_result=subscribed) from exc
+
     def unsubscribe_from_topic(self, topic_id: str, client_uuid: str) -> bool:
-        """
-        Unsubscribe a client from a topic.
-        
-        Args:
-            topic_id: Topic identifier
-            client_uuid: Client's UUID
-            
-        Returns:
-            True if successful
-        """
-        if not self.client:
-            self.fallback_topic_subscribers.get(topic_id, set()).discard(client_uuid)
-            self.fallback_client_topics.get(client_uuid, set()).discard(topic_id)
-            return True
-
+        unsubscribed = self.fallback.unsubscribe_from_topic(topic_id, client_uuid)
         try:
-            subscribers_key = f"topic:{topic_id}:subscribers"
-            self.client.srem(subscribers_key, client_uuid)
+            def op() -> bool:
+                pipe = self._client.pipeline()
+                pipe.srem(f"topic:{topic_id}:subscribers", client_uuid)
+                pipe.srem(f"client:{client_uuid}:topics", topic_id)
+                pipe.execute()
+                return unsubscribed
 
-            # Remove from client's subscriptions
-            client_topics_key = f"client:{client_uuid}:topics"
-            self.client.srem(client_topics_key, topic_id)
+            return self._execute(op, description="unsubscribe_from_topic")
+        except RedisUnavailableError as exc:
+            self._backfill_needed = True
+            raise RedisUnavailableError(exc.args[0], fallback_result=unsubscribed) from exc
 
-            logger.info(f"Client {client_uuid} unsubscribed from topic {topic_id}")
-            return True
-        except Exception as e:
-            logger.error(f"Error unsubscribing from topic: {e}")
-            return False
-    
-    def get_topic_subscribers(self, topic_id: str) -> Set[str]:
-        """
-        Get all subscribers to a topic.
-        
-        Args:
-            topic_id: Topic identifier
-            
-        Returns:
-            Set of client UUIDs
-        """
-        if not self.client:
-            return set(self.fallback_topic_subscribers.get(topic_id, set()))
-        
+    def get_topic_subscribers(self, topic_id: str) -> set[str]:
+        fallback_value = self.fallback.get_topic_subscribers(topic_id)
         try:
-            subscribers_key = f"topic:{topic_id}:subscribers"
-            subscribers = self.client.smembers(subscribers_key)
-            return set(subscribers) if subscribers else set()
-        except Exception as e:
-            logger.error(f"Error getting topic subscribers: {e}")
-            return set()
-    
-    def get_client_topics(self, client_uuid: str) -> Set[str]:
-        """
-        Get all topics a client is subscribed to.
-        
-        Args:
-            client_uuid: Client's UUID
-            
-        Returns:
-            Set of topic IDs
-        """
-        if not self.client:
-            return set(self.fallback_client_topics.get(client_uuid, set()))
-        
+            def op() -> set[str]:
+                subscribers = self._client.smembers(f"topic:{topic_id}:subscribers")
+                return set(subscribers) if subscribers else set()
+
+            return self._execute(op, description="get_topic_subscribers")
+        except RedisUnavailableError as exc:
+            raise RedisUnavailableError(exc.args[0], fallback_result=fallback_value) from exc
+
+    def get_client_topics(self, client_uuid: str) -> set[str]:
+        fallback_value = self.fallback.get_client_topics(client_uuid)
         try:
-            client_topics_key = f"client:{client_uuid}:topics"
-            topics = self.client.smembers(client_topics_key)
-            return set(topics) if topics else set()
-        except Exception as e:
-            logger.error(f"Error getting client topics: {e}")
-            return set()
-    
+            def op() -> set[str]:
+                topics = self._client.smembers(f"client:{client_uuid}:topics")
+                return set(topics) if topics else set()
+
+            return self._execute(op, description="get_client_topics")
+        except RedisUnavailableError as exc:
+            raise RedisUnavailableError(exc.args[0], fallback_result=fallback_value) from exc
+
     def cleanup_client(self, client_uuid: str) -> bool:
-        """
-        Clean up all client data on disconnect.
-        
-        Args:
-            client_uuid: Client's UUID
-            
-        Returns:
-            True if successful
-        """
-        if not self.client:
-            return False
-        
+        topics_for_cleanup = self.fallback.get_client_topics(client_uuid)
+        self.fallback.cleanup_client(client_uuid)
         try:
-            # Get client's topics
-            topics = self.get_client_topics(client_uuid)
-            
-            # Unsubscribe from all topics
-            for topic_id in topics:
-                self.unsubscribe_from_topic(topic_id, client_uuid)
-            
-            # Mark as disconnected
-            self.set_client_disconnected(client_uuid)
-            
-            logger.info(f"Client cleanup completed: {client_uuid}")
+            def op() -> bool:
+                pipe = self._client.pipeline()
+                for topic_id in topics_for_cleanup:
+                    pipe.srem(f"topic:{topic_id}:subscribers", client_uuid)
+                pipe.hdel("connected_clients", client_uuid)
+                pipe.delete(f"client:{client_uuid}:topics")
+                pipe.execute()
+                return True
+
+            self._execute(op, description="cleanup_client")
             return True
-        except Exception as e:
-            logger.error(f"Error cleaning up client: {e}")
-            return False
+        except RedisUnavailableError as exc:
+            self._backfill_needed = True
+            raise RedisUnavailableError(exc.args[0], fallback_result=True) from exc
 
 
 # Global Redis store instance
 redis_store = RedisStore()
+

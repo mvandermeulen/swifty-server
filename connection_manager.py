@@ -7,7 +7,7 @@ from typing import Dict, Optional
 from uuid import UUID
 import logging
 
-from redis_store import redis_store
+from redis_store import RedisUnavailableError, redis_store
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -38,13 +38,14 @@ class ConnectionManager:
     
     def __init__(self):
         # Dictionary mapping client UUID to WebSocket connection (in-memory)
-        self.active_connections: Dict[str, WebSocket] = {}
+        self.active_connections: dict[str, WebSocket] = {}
         # Fallback dictionary for client names (when Redis is unavailable)
-        self.client_names: Dict[str, str] = {}
+        self.client_names: dict[str, str] = {}
+        self.client_names: dict[str, str] = {}
         # Pending deliveries awaiting acknowledgment
-        self.pending_deliveries: Dict[str, PendingDelivery] = {}
+        self.pending_deliveries: dict[str, PendingDelivery] = {}
         self._pending_lock = asyncio.Lock()
-        self._delivery_worker_task: Optional[asyncio.Task] = None
+        self._delivery_worker_task: asyncio.Task | None = None
         self._worker_started = False
         self._ack_timeout_seconds = 10
         self._base_backoff_seconds = 2
@@ -65,6 +66,13 @@ class ConnectionManager:
         self.client_names[client_uuid_str] = client_name
 
         # Store in Redis
+        try:
+            redis_store.set_client_connected(client_uuid_str, client_name)
+        except RedisUnavailableError as exc:
+            logger.warning(
+                "Redis unavailable while marking client connected %s: %s", client_uuid_str, exc
+            )
+        
         redis_store.set_client_connected(client_uuid_str, client_name)
 
         # Ensure background worker is running
@@ -91,7 +99,12 @@ class ConnectionManager:
                 del self.client_names[client_uuid_str]
             
             # Clean up Redis
-            redis_store.cleanup_client(client_uuid_str)
+            try:
+                redis_store.cleanup_client(client_uuid_str)
+            except RedisUnavailableError as exc:
+                logger.warning(
+                    "Redis unavailable while cleaning up client %s: %s", client_uuid_str, exc
+                )
             
             logger.info(f"Client disconnected: {client_name} ({client_uuid_str})")
             logger.info(f"Active connections: {len(self.active_connections)}")
@@ -142,7 +155,7 @@ class ConnectionManager:
             await self._register_pending(msgid, message, recipient_uuid_str, sender_uuid, stored_offline=queued)
         return DeliveryResult("queued_offline", "Recipient offline - message queued for delivery")
     
-    async def broadcast(self, message: dict, exclude: Optional[UUID] = None):
+    async def broadcast(self, message: dict, exclude: UUID | None = None):
         """
         Broadcast a message to all connected clients.
         
@@ -216,7 +229,7 @@ class ConnectionManager:
         """
         return str(client_uuid) in self.active_connections
     
-    def get_connected_clients(self) -> Dict[str, str]:
+    def get_connected_clients(self) -> dict[str, str]:
         """
         Get a dictionary of all connected clients.
         
@@ -224,10 +237,19 @@ class ConnectionManager:
             Dictionary mapping UUIDs to client names
         """
         # Try Redis first, fallback to in-memory
-        redis_clients = redis_store.get_connected_clients()
-        return redis_clients if redis_clients else self.client_names.copy()
+        try:
+            redis_clients = redis_store.get_connected_clients()
+            if redis_clients:
+                return redis_clients
+        except RedisUnavailableError as exc:
+            if isinstance(exc.fallback_result, dict):
+                return exc.fallback_result
+            logger.warning("Redis unavailable when listing clients: %s", exc)
+        return self.client_names.copy()
     
-    async def broadcast_to_topic(self, topic_id: str, message: dict, exclude: Optional[UUID] = None):
+    async def broadcast_to_topic(
+        self, topic_id: str, message: dict, exclude: UUID | None = None
+    ):
         """
         Broadcast a message to all subscribers of a topic.
         
@@ -237,7 +259,13 @@ class ConnectionManager:
             exclude: Optional UUID to exclude from broadcast
         """
         # Get topic subscribers from Redis
-        subscribers = redis_store.get_topic_subscribers(topic_id)
+        try:
+            subscribers = redis_store.get_topic_subscribers(topic_id)
+        except RedisUnavailableError as exc:
+            subscribers = exc.fallback_result or set()
+            logger.warning(
+                "Redis unavailable when fetching subscribers for %s: %s", topic_id, exc
+            )
         exclude_str = str(exclude) if exclude else None
         
         sent_count = 0
