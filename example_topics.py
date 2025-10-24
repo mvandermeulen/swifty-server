@@ -30,7 +30,8 @@ class TopicClient:
         self.server_url = server_url.rstrip('/')
         self.name = name
         self.uuid = uuid4()
-        self.token = None
+        self.access_token = None
+        self.refresh_token = None
         self.ws = None
     
     def register(self):
@@ -47,7 +48,8 @@ class TopicClient:
         
         if response.status_code == 200:
             data = response.json()
-            self.token = data["token"]
+            self.access_token = data.get("access_token")
+            self.refresh_token = data.get("refresh_token")
             print(f"[{self.name}] ✓ Registration successful!")
             return True
         else:
@@ -60,7 +62,7 @@ class TopicClient:
         
         response = requests.post(
             f"{self.server_url}/topics/create",
-            params={"token": self.token},
+            params={"token": self.access_token},
             json={
                 "topic_id": topic_id,
                 "metadata": metadata or {}
@@ -94,7 +96,7 @@ class TopicClient:
         
         response = requests.post(
             f"{self.server_url}/topics/subscribe",
-            params={"token": self.token},
+            params={"token": self.access_token},
             json={"topic_id": topic_id}
         )
         
@@ -122,12 +124,12 @@ class TopicClient:
     
     async def connect(self):
         """Connect to WebSocket endpoint."""
-        if not self.token:
+        if not self.access_token:
             print(f"[{self.name}] ✗ No token available. Please register first.")
             return False
-        
+
         ws_url = self.server_url.replace('http://', 'ws://').replace('https://', 'wss://')
-        uri = f"{ws_url}/ws?token={self.token}"
+        uri = f"{ws_url}/ws?token={self.access_token}"
         
         print(f"[{self.name}] Connecting to WebSocket...")
         try:

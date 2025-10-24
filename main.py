@@ -8,15 +8,28 @@ This server provides:
 - Message routing between clients by UUID
 """
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
-from fastapi.responses import JSONResponse
-from typing import Optional
 from uuid import UUID
 import json
 import time
 import logging
 
-from models import ClientRegistration, Message, MessageAcknowledgment, TopicCreate, TopicSubscribe, TopicMessage
-from auth import create_access_token, verify_token
+from models import (
+    ClientRegistration,
+    Message,
+    MessageAcknowledgment,
+    TopicCreate,
+    TopicSubscribe,
+    TopicMessage,
+    TokenRefreshRequest,
+    TokenRevokeRequest,
+)
+from auth import (
+    issue_token_pair,
+    verify_token,
+    rotate_refresh_token,
+    revoke_token,
+    revoke_client_tokens,
+)
 from connection_manager import ConnectionManager
 from redis_store import redis_store
 
@@ -35,6 +48,12 @@ app = FastAPI(
 manager = ConnectionManager()
 
 
+def _require_admin(payload: dict) -> None:
+    roles = payload.get("roles") or []
+    if "admin" not in roles:
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+
+
 @app.get("/")
 async def root():
     """Root endpoint."""
@@ -48,7 +67,9 @@ async def root():
             "topics": "/topics",
             "create_topic": "/topics/create",
             "subscribe": "/topics/subscribe",
-            "unsubscribe": "/topics/unsubscribe"
+            "unsubscribe": "/topics/unsubscribe",
+            "refresh": "/auth/refresh",
+            "revoke_tokens": "/admin/tokens/revoke",
         }
     }
 
@@ -62,16 +83,22 @@ async def register_client(registration: ClientRegistration):
         registration: Client registration data (name and UUID)
         
     Returns:
-        JWT token for authentication
+        Authentication tokens and client metadata
     """
     try:
-        # Create JWT token
-        token = create_access_token(registration.uuid, registration.name)
-        
+        tokens = issue_token_pair(registration.uuid, registration.name)
+
         logger.info(f"Client registered: {registration.name} ({registration.uuid})")
-        
+
         return {
-            "token": token,
+            "access_token": tokens["access_token"],
+            "access_token_expires_at": tokens["access_token_expires_at"],
+            "access_token_expires_in": tokens["access_token_expires_in"],
+            "refresh_token": tokens["refresh_token"],
+            "refresh_token_expires_at": tokens["refresh_token_expires_at"],
+            "refresh_token_expires_in": tokens["refresh_token_expires_in"],
+            "token_type": tokens["token_type"],
+            "roles": tokens["roles"],
             "uuid": str(registration.uuid),
             "name": registration.name,
             "message": "Registration successful"
@@ -79,6 +106,17 @@ async def register_client(registration: ClientRegistration):
     except Exception as e:
         logger.error(f"Registration error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/auth/refresh")
+async def refresh_tokens(request: TokenRefreshRequest):
+    """Exchange a refresh token for a new access/refresh pair."""
+
+    tokens = rotate_refresh_token(request.refresh_token)
+    if not tokens:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+    return tokens
 
 
 @app.get("/clients")
@@ -109,10 +147,12 @@ async def create_topic(topic: TopicCreate, token: str = Query(..., description="
         Success message
     """
     # Verify token
-    payload = verify_token(token)
+    payload = verify_token(token, expected_type="access")
     if not payload:
         raise HTTPException(status_code=401, detail="Invalid token")
-    
+
+    _require_admin(payload)
+
     client_uuid = payload["sub"]
     
     # Check if topic already exists
@@ -175,7 +215,7 @@ async def subscribe_to_topic(subscription: TopicSubscribe, token: str = Query(..
         Success message
     """
     # Verify token
-    payload = verify_token(token)
+    payload = verify_token(token, expected_type="access")
     if not payload:
         raise HTTPException(status_code=401, detail="Invalid token")
     
@@ -213,7 +253,7 @@ async def unsubscribe_from_topic(subscription: TopicSubscribe, token: str = Quer
         Success message
     """
     # Verify token
-    payload = verify_token(token)
+    payload = verify_token(token, expected_type="access")
     if not payload:
         raise HTTPException(status_code=401, detail="Invalid token")
     
@@ -259,6 +299,34 @@ async def get_topic_info(topic_id: str):
     }
 
 
+@app.post("/admin/tokens/revoke")
+async def admin_revoke_tokens(
+    revoke_request: TokenRevokeRequest,
+    token: str = Query(..., description="Administrator access token"),
+):
+    """Revoke tokens stored in Redis via an administrative API."""
+
+    payload = verify_token(token, expected_type="access")
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    _require_admin(payload)
+
+    revoked_count = 0
+    if revoke_request.token or revoke_request.jti:
+        revoked = revoke_token(token=revoke_request.token, jti=revoke_request.jti)
+        revoked_count = 1 if revoked else 0
+    elif revoke_request.client_uuid:
+        revoked_count = revoke_client_tokens(revoke_request.client_uuid, revoke_request.token_type)
+    else:
+        raise HTTPException(status_code=400, detail="No revocation target specified")
+
+    if revoked_count == 0:
+        raise HTTPException(status_code=404, detail="Token(s) not found")
+
+    return {"revoked": revoked_count}
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(
     websocket: WebSocket,
@@ -275,7 +343,7 @@ async def websocket_endpoint(
         token: JWT authentication token
     """
     # Verify token
-    payload = verify_token(token)
+    payload = verify_token(token, expected_type="access")
     if not payload:
         await websocket.close(code=1008, reason="Invalid token")
         return
@@ -337,7 +405,7 @@ async def websocket_endpoint(
                         continue
                     
                     # Verify sender is subscribed to topic
-                    if not redis_store.get_topic_subscribers(topic_msg.topic_id).__contains__(str(client_uuid)):
+                    if str(client_uuid) not in redis_store.get_topic_subscribers(topic_msg.topic_id):
                         await websocket.send_json({
                             "type": "error",
                             "message": f"Not subscribed to topic {topic_msg.topic_id}",

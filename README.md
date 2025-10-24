@@ -141,14 +141,47 @@ POST /register
 **Response:**
 ```json
 {
-  "token": "jwt-token",
+  "access_token": "jwt-access-token",
+  "access_token_expires_at": "2024-01-01T12:00:00+00:00",
+  "access_token_expires_in": 900,
+  "refresh_token": "jwt-refresh-token",
+  "refresh_token_expires_at": "2024-01-02T12:00:00+00:00",
+  "refresh_token_expires_in": 86400,
+  "token_type": "bearer",
+  "roles": ["user"],
   "uuid": "client-uuid",
   "name": "Client Name",
   "message": "Registration successful"
 }
 ```
 
-#### 3. Get Connected Clients
+#### 3. Refresh Tokens
+```
+POST /auth/refresh
+```
+
+**Request Body:**
+```json
+{
+  "refresh_token": "jwt-refresh-token"
+}
+```
+
+**Response:**
+```json
+{
+  "access_token": "new-access-token",
+  "access_token_expires_at": "2024-01-01T13:00:00+00:00",
+  "refresh_token": "rotated-refresh-token",
+  "refresh_token_expires_at": "2024-01-02T13:00:00+00:00",
+  "token_type": "bearer",
+  "roles": ["user"]
+}
+```
+
+Use this endpoint to rotate refresh tokens and obtain a new access token. Previous refresh tokens are revoked when rotation is enabled.
+
+#### 4. Get Connected Clients
 ```
 GET /clients
 ```
@@ -164,9 +197,10 @@ GET /clients
 }
 ```
 
-#### 4. Create Topic/Room
+#### 5. Create Topic/Room
+Requires an access token that includes the `admin` role.
 ```
-POST /topics/create?token={jwt-token}
+POST /topics/create?token={access-token}
 ```
 
 **Request Body:**
@@ -188,7 +222,7 @@ POST /topics/create?token={jwt-token}
 }
 ```
 
-#### 5. List Topics
+#### 6. List Topics
 ```
 GET /topics
 ```
@@ -208,7 +242,7 @@ GET /topics
 }
 ```
 
-#### 6. Get Topic Info
+#### 7. Get Topic Info
 ```
 GET /topics/{topic_id}
 ```
@@ -224,7 +258,7 @@ GET /topics/{topic_id}
 }
 ```
 
-#### 7. Subscribe to Topic
+#### 8. Subscribe to Topic
 ```
 POST /topics/subscribe?token={jwt-token}
 ```
@@ -236,7 +270,7 @@ POST /topics/subscribe?token={jwt-token}
 }
 ```
 
-#### 8. Unsubscribe from Topic
+#### 9. Unsubscribe from Topic
 ```
 POST /topics/unsubscribe?token={jwt-token}
 ```
@@ -248,7 +282,7 @@ POST /topics/unsubscribe?token={jwt-token}
 }
 ```
 
-#### 9. WebSocket Connection
+#### 10. WebSocket Connection
 ```
 WS /ws?token={jwt-token}
 ```
@@ -415,3 +449,19 @@ MIT License
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+#### Administrative Token Revocation
+```
+POST /admin/tokens/revoke?token={admin-access-token}
+```
+
+Provide a JSON body to revoke individual tokens or all tokens for a specific client:
+
+```json
+{
+  "client_uuid": "client-uuid",
+  "token_type": "refresh"
+}
+```
+
+The calling token must include the `admin` role.
+
