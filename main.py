@@ -18,7 +18,7 @@ import logging
 from models import ClientRegistration, Message, MessageAcknowledgment, TopicCreate, TopicSubscribe, TopicMessage
 from auth import create_access_token, verify_token
 from connection_manager import ConnectionManager
-from redis_store import redis_store
+from redis_store import RedisOperationError, RedisUnavailableError, redis_store
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -48,7 +48,8 @@ async def root():
             "topics": "/topics",
             "create_topic": "/topics/create",
             "subscribe": "/topics/subscribe",
-            "unsubscribe": "/topics/unsubscribe"
+            "unsubscribe": "/topics/unsubscribe",
+            "redis_health": "/health/redis",
         }
     }
 
@@ -116,14 +117,44 @@ async def create_topic(topic: TopicCreate, token: str = Query(..., description="
     client_uuid = payload["sub"]
     
     # Check if topic already exists
-    existing = redis_store.get_topic(topic.topic_id)
+    try:
+        existing = redis_store.get_topic(topic.topic_id)
+    except RedisUnavailableError as exc:
+        existing = exc.fallback_result
+        if existing:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "detail": "Topic already exists (fallback store)",
+                    "topic": existing,
+                },
+            )
+    except RedisOperationError as exc:
+        logger.error("Error retrieving topic %s: %s", topic.topic_id, exc)
+        raise HTTPException(status_code=500, detail="Failed to check topic availability")
+
     if existing:
         raise HTTPException(status_code=400, detail="Topic already exists")
-    
-    # Create topic
-    success = redis_store.create_topic(topic.topic_id, client_uuid, topic.metadata)
-    if not success:
+
+    try:
+        success = redis_store.create_topic(topic.topic_id, client_uuid, topic.metadata)
+    except RedisUnavailableError as exc:
+        logger.warning("Redis unavailable when creating topic %s: %s", topic.topic_id, exc)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": "Redis unavailable; topic recorded via fallback store",
+                "topic_id": topic.topic_id,
+                "creator": client_uuid,
+                "metadata": topic.metadata or {},
+            },
+        )
+    except RedisOperationError as exc:
+        logger.error("Error creating topic %s: %s", topic.topic_id, exc)
         raise HTTPException(status_code=500, detail="Failed to create topic")
+
+    if not success:
+        raise HTTPException(status_code=400, detail="Topic already exists")
     
     logger.info(f"Topic created: {topic.topic_id} by {client_uuid}")
     
@@ -142,23 +173,49 @@ async def list_topics():
     Returns:
         List of topic IDs with details
     """
-    topic_ids = redis_store.list_topics()
+    source = "redis"
+    try:
+        topic_ids = redis_store.list_topics()
+    except RedisUnavailableError as exc:
+        topic_ids = exc.fallback_result or []
+        source = "fallback"
+        logger.warning("Redis unavailable when listing topics: %s", exc)
+    except RedisOperationError as exc:
+        logger.error("Error listing topics: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to list topics")
     topics = []
     
     for topic_id in topic_ids:
-        topic_data = redis_store.get_topic(topic_id)
+        topic_data_source = "redis"
+        try:
+            topic_data = redis_store.get_topic(topic_id)
+        except RedisUnavailableError as exc:
+            topic_data = exc.fallback_result
+            topic_data_source = "fallback"
+        except RedisOperationError as exc:
+            logger.error("Error retrieving topic %s: %s", topic_id, exc)
+            continue
         if topic_data:
-            subscribers = redis_store.get_topic_subscribers(topic_id)
+            try:
+                subscribers = redis_store.get_topic_subscribers(topic_id)
+            except RedisUnavailableError as exc:
+                subscribers = exc.fallback_result or set()
+                topic_data_source = "fallback"
+            except RedisOperationError as exc:
+                logger.error("Error retrieving topic subscribers for %s: %s", topic_id, exc)
+                subscribers = set()
             topics.append({
                 "id": topic_id,
                 "creator": topic_data.get("creator"),
                 "metadata": topic_data.get("metadata", {}),
-                "subscriber_count": len(subscribers)
+                "subscriber_count": len(subscribers),
+                "source": topic_data_source,
             })
-    
+
     return {
         "count": len(topics),
-        "topics": topics
+        "topics": topics,
+        "source": source,
     }
 
 
@@ -182,15 +239,50 @@ async def subscribe_to_topic(subscription: TopicSubscribe, token: str = Query(..
     client_uuid = payload["sub"]
     
     # Check if topic exists
-    topic = redis_store.get_topic(subscription.topic_id)
+    try:
+        topic = redis_store.get_topic(subscription.topic_id)
+    except RedisUnavailableError as exc:
+        topic = exc.fallback_result
+        if not topic:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "detail": "Redis unavailable; topic lookup failed",
+                    "topic_id": subscription.topic_id,
+                },
+            )
+    except RedisOperationError as exc:
+        logger.error("Error retrieving topic %s: %s", subscription.topic_id, exc)
+        raise HTTPException(status_code=500, detail="Failed to validate topic")
     if not topic:
         raise HTTPException(status_code=404, detail="Topic not found")
-    
-    # Subscribe
-    success = redis_store.subscribe_to_topic(subscription.topic_id, client_uuid)
+
+    try:
+        success = redis_store.subscribe_to_topic(subscription.topic_id, client_uuid)
+    except RedisUnavailableError as exc:
+        logger.warning(
+            "Redis unavailable when subscribing %s to %s: %s",
+            client_uuid,
+            subscription.topic_id,
+            exc,
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": "Redis unavailable; subscription recorded via fallback store",
+                "topic_id": subscription.topic_id,
+                "client_uuid": client_uuid,
+            },
+        )
+    except RedisOperationError as exc:
+        logger.error(
+            "Error subscribing %s to %s: %s", client_uuid, subscription.topic_id, exc
+        )
+        raise HTTPException(status_code=500, detail="Failed to subscribe")
+
     if not success:
         raise HTTPException(status_code=500, detail="Failed to subscribe")
-    
+
     logger.info(f"Client {client_uuid} subscribed to topic {subscription.topic_id}")
     
     return {
@@ -220,10 +312,32 @@ async def unsubscribe_from_topic(subscription: TopicSubscribe, token: str = Quer
     client_uuid = payload["sub"]
     
     # Unsubscribe
-    success = redis_store.unsubscribe_from_topic(subscription.topic_id, client_uuid)
+    try:
+        success = redis_store.unsubscribe_from_topic(subscription.topic_id, client_uuid)
+    except RedisUnavailableError as exc:
+        logger.warning(
+            "Redis unavailable when unsubscribing %s from %s: %s",
+            client_uuid,
+            subscription.topic_id,
+            exc,
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": "Redis unavailable; unsubscribe recorded via fallback store",
+                "topic_id": subscription.topic_id,
+                "client_uuid": client_uuid,
+            },
+        )
+    except RedisOperationError as exc:
+        logger.error(
+            "Error unsubscribing %s from %s: %s", client_uuid, subscription.topic_id, exc
+        )
+        raise HTTPException(status_code=500, detail="Failed to unsubscribe")
+
     if not success:
         raise HTTPException(status_code=500, detail="Failed to unsubscribe")
-    
+
     logger.info(f"Client {client_uuid} unsubscribed from topic {subscription.topic_id}")
     
     return {
@@ -244,12 +358,32 @@ async def get_topic_info(topic_id: str):
     Returns:
         Topic information
     """
-    topic = redis_store.get_topic(topic_id)
+    try:
+        topic = redis_store.get_topic(topic_id)
+    except RedisUnavailableError as exc:
+        topic = exc.fallback_result
+        if not topic:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "detail": "Redis unavailable; topic not found in fallback",
+                    "topic_id": topic_id,
+                },
+            )
+    except RedisOperationError as exc:
+        logger.error("Error retrieving topic %s: %s", topic_id, exc)
+        raise HTTPException(status_code=500, detail="Failed to get topic")
     if not topic:
         raise HTTPException(status_code=404, detail="Topic not found")
-    
-    subscribers = redis_store.get_topic_subscribers(topic_id)
-    
+
+    try:
+        subscribers = redis_store.get_topic_subscribers(topic_id)
+    except RedisUnavailableError as exc:
+        subscribers = exc.fallback_result or set()
+    except RedisOperationError as exc:
+        logger.error("Error retrieving subscribers for %s: %s", topic_id, exc)
+        subscribers = set()
+
     return {
         "id": topic_id,
         "creator": topic.get("creator"),
@@ -257,6 +391,12 @@ async def get_topic_info(topic_id: str):
         "subscriber_count": len(subscribers),
         "subscribers": list(subscribers)
     }
+
+
+@app.get("/health/redis")
+async def redis_health():
+    """Redis health status and fallback information."""
+    return redis_store.check_health()
 
 
 @app.websocket("/ws")
@@ -327,7 +467,17 @@ async def websocket_endpoint(
                         continue
                     
                     # Verify topic exists
-                    topic = redis_store.get_topic(topic_msg.topic_id)
+                    try:
+                        topic = redis_store.get_topic(topic_msg.topic_id)
+                    except RedisUnavailableError as exc:
+                        topic = exc.fallback_result
+                    except RedisOperationError as exc:
+                        logger.error(
+                            "Error fetching topic %s for websocket message: %s",
+                            topic_msg.topic_id,
+                            exc,
+                        )
+                        topic = None
                     if not topic:
                         await websocket.send_json({
                             "type": "error",
@@ -335,9 +485,21 @@ async def websocket_endpoint(
                             "timestamp": time.time()
                         })
                         continue
-                    
+
                     # Verify sender is subscribed to topic
-                    if not redis_store.get_topic_subscribers(topic_msg.topic_id).__contains__(str(client_uuid)):
+                    try:
+                        subscribers = redis_store.get_topic_subscribers(topic_msg.topic_id)
+                    except RedisUnavailableError as exc:
+                        subscribers = exc.fallback_result or set()
+                    except RedisOperationError as exc:
+                        logger.error(
+                            "Error fetching subscribers for topic %s: %s",
+                            topic_msg.topic_id,
+                            exc,
+                        )
+                        subscribers = set()
+
+                    if str(client_uuid) not in subscribers:
                         await websocket.send_json({
                             "type": "error",
                             "message": f"Not subscribed to topic {topic_msg.topic_id}",
