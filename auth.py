@@ -2,15 +2,15 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Sequence
 from uuid import UUID, uuid4
 
 from jose import JWTError, jwt
 
-from redis_store import RedisOperationError, RedisUnavailableError, redis_store
 from config import get_settings
+from redis_store import RedisOperationError, RedisUnavailableError, redis_store
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -30,31 +30,10 @@ class TokenDetails:
     def expires_in(self) -> int:
         """Return remaining lifetime in seconds."""
 
-# Secret key for JWT - in production, use environment variable
-SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-secret-key-change-in-production")
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
-
-
-def create_access_token(
-    client_uuid: UUID, client_name: str, expires_delta: timedelta | None = None
-) -> str:
-    """
-    Create a JWT access token for a client.
-    
-    Args:
-        client_uuid: Client's UUID
-        client_name: Client's name
-        expires_delta: Optional expiration time delta
-        
-    Returns:
-        JWT token string
-    """
-    to_encode = {
         return max(int((self.expires_at - datetime.now(timezone.utc)).total_seconds()), 0)
 
 
-def _normalise_roles(client_uuid: UUID, roles: Optional[Sequence[str]]) -> list[str]:
+def _normalise_roles(client_uuid: UUID, roles: Sequence[str] | None) -> list[str]:
     """Resolve token roles by combining defaults and administrator overrides."""
 
     resolved_roles = list(roles) if roles else list(settings.default_client_roles)
@@ -69,12 +48,12 @@ def _issue_token(
     client_name: str,
     roles: Sequence[str],
     token_type: str,
-    expires_delta: timedelta,
+    lifetime: timedelta,
 ) -> TokenDetails:
     """Create, sign, and persist a token."""
 
     now = datetime.now(timezone.utc)
-    expires_at = now + expires_delta
+    expires_at = now + lifetime
     jti = str(uuid4())
     payload = {
         "sub": str(client_uuid),
@@ -86,56 +65,30 @@ def _issue_token(
         "nbf": now,
         "exp": expires_at,
     }
-    
-    if expires_delta:
-        expire = datetime.now(timezone.utc) + expires_delta
-    else:
-        expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    
-    # Store token in Redis
-    try:
-        redis_store.register_client(str(client_uuid), client_name, encoded_jwt)
-    except RedisUnavailableError as exc:
-        logger.warning("Redis unavailable during client registration: %s", exc)
-    
-    return encoded_jwt
-
-
-def verify_token(token: str) -> dict | None:
-    """
-    Verify and decode a JWT token.
-    
-    Args:
-        token: JWT token string
-        
-    Returns:
-        Decoded token payload or None if invalid
-    """
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        
-        # Verify token exists in Redis (if available)
-        try:
-            client_uuid = redis_store.get_client_by_token(token)
-        except RedisUnavailableError as exc:
-            client_uuid = exc.fallback_result
-        except RedisOperationError as exc:
-            logger.error("Redis error during token verification: %s", exc)
-            return None
-        if client_uuid and client_uuid != payload.get("sub"):
-            logger.warning(f"Token UUID mismatch: {client_uuid} vs {payload.get('sub')}")
-            return None
-        
-        return payload
-    except JWTError:
 
     encoded_jwt = jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
-    ttl_seconds = max(int(expires_delta.total_seconds()), 1)
-    if not redis_store.store_token(jti, encoded_jwt, str(client_uuid), token_type, ttl_seconds):
-        logger.warning("Unable to persist token metadata for client %s (%s)", client_name, client_uuid)
+    ttl_seconds = max(int(lifetime.total_seconds()), 1)
+
+    try:
+        stored = redis_store.store_token(
+            jti=jti,
+            token=encoded_jwt,
+            client_uuid=str(client_uuid),
+            token_type=token_type,
+            ttl_seconds=ttl_seconds,
+            expires_at=expires_at,
+        )
+        if not stored:
+            logger.warning(
+                "Unable to persist %s token metadata for client %s (%s)",
+                token_type,
+                client_name,
+                client_uuid,
+            )
+    except RedisUnavailableError as exc:
+        logger.warning("Redis unavailable while storing %s token metadata: %s", token_type, exc)
+    except RedisOperationError as exc:
+        logger.error("Redis error storing %s token metadata: %s", token_type, exc)
 
     audit_logger.info(
         "Issued %s token",
@@ -154,8 +107,8 @@ def verify_token(token: str) -> dict | None:
 def create_access_token(
     client_uuid: UUID,
     client_name: str,
-    roles: Optional[Sequence[str]] = None,
-    expires_delta: Optional[timedelta] = None,
+    roles: Sequence[str] | None = None,
+    expires_delta: timedelta | None = None,
 ) -> TokenDetails:
     """Create a signed access token for a client."""
 
@@ -167,8 +120,8 @@ def create_access_token(
 def create_refresh_token(
     client_uuid: UUID,
     client_name: str,
-    roles: Optional[Sequence[str]] = None,
-    expires_delta: Optional[timedelta] = None,
+    roles: Sequence[str] | None = None,
+    expires_delta: timedelta | None = None,
 ) -> TokenDetails:
     """Create a signed refresh token for a client."""
 
@@ -180,7 +133,7 @@ def create_refresh_token(
 def issue_token_pair(
     client_uuid: UUID,
     client_name: str,
-    roles: Optional[Sequence[str]] = None,
+    roles: Sequence[str] | None = None,
 ) -> dict:
     """Issue a fresh access and refresh token pair."""
 
@@ -188,9 +141,27 @@ def issue_token_pair(
     access_token = create_access_token(client_uuid, client_name, roles=resolved_roles)
     refresh_token = create_refresh_token(client_uuid, client_name, roles=resolved_roles)
 
-    redis_store.register_client(str(client_uuid), client_name, last_token_jti=access_token.jti)
+    try:
+        redis_store.register_client(str(client_uuid), client_name, access_token.token)
+    except (RedisUnavailableError, RedisOperationError) as exc:
+        logger.warning(
+            "Unable to record client %s (%s) in Redis during issuance: %s",
+            client_name,
+            client_uuid,
+            exc,
+        )
 
-    response = {
+    audit_logger.info(
+        "Issued token pair",
+        extra={
+            "client_uuid": str(client_uuid),
+            "client_name": client_name,
+            "access_jti": access_token.jti,
+            "refresh_jti": refresh_token.jti,
+        },
+    )
+
+    return {
         "access_token": access_token.token,
         "access_token_expires_at": access_token.expires_at.isoformat(),
         "access_token_expires_in": access_token.expires_in,
@@ -201,14 +172,8 @@ def issue_token_pair(
         "roles": resolved_roles,
     }
 
-    audit_logger.info(
-        "Issued token pair",
-        extra={"client_uuid": str(client_uuid), "client_name": client_name, "access_jti": access_token.jti},
-    )
-    return response
 
-
-def verify_token(token: str, expected_type: str = "access") -> Optional[dict]:
+def verify_token(token: str, expected_type: str = "access") -> dict | None:
     """Verify and decode a JWT token."""
 
     try:
@@ -219,7 +184,9 @@ def verify_token(token: str, expected_type: str = "access") -> Optional[dict]:
 
     if expected_type and payload.get("type") != expected_type:
         audit_logger.warning(
-            "Token type mismatch: expected %s but received %s", expected_type, payload.get("type")
+            "Token type mismatch: expected %s but received %s",
+            expected_type,
+            payload.get("type"),
         )
         return None
 
@@ -228,14 +195,23 @@ def verify_token(token: str, expected_type: str = "access") -> Optional[dict]:
         audit_logger.warning("Token missing jti claim")
         return None
 
-    if not redis_store.is_token_active(jti, token):
+    try:
+        active = redis_store.is_token_active(jti, token)
+    except RedisUnavailableError as exc:
+        active = bool(exc.fallback_result)
+        logger.warning("Redis unavailable during token verification: %s", exc)
+    except RedisOperationError as exc:
+        logger.error("Redis error verifying token %s: %s", jti, exc)
+        return None
+
+    if not active:
         audit_logger.warning("Inactive or revoked token used", extra={"jti": jti})
         return None
 
     return payload
 
 
-def rotate_refresh_token(refresh_token: str) -> Optional[dict]:
+def rotate_refresh_token(refresh_token: str) -> dict | None:
     """Rotate a refresh token and issue a new token pair."""
 
     payload = verify_token(refresh_token, expected_type="refresh")
@@ -254,14 +230,31 @@ def rotate_refresh_token(refresh_token: str) -> Optional[dict]:
 
     previous_jti = payload.get("jti")
     if settings.token_rotation_enabled and previous_jti:
-        redis_store.revoke_token(previous_jti)
-        audit_logger.info("Revoked previous refresh token", extra={"jti": previous_jti, "client_uuid": str(client_uuid)})
+        try:
+            redis_store.revoke_token(previous_jti)
+            audit_logger.info(
+                "Revoked previous refresh token",
+                extra={"jti": previous_jti, "client_uuid": str(client_uuid)},
+            )
+        except RedisUnavailableError as exc:
+            logger.warning("Redis unavailable while revoking refresh token %s: %s", previous_jti, exc)
+        except RedisOperationError as exc:
+            logger.error("Redis error revoking refresh token %s: %s", previous_jti, exc)
 
     resolved_roles = _normalise_roles(client_uuid, roles)
 
     access_token = create_access_token(client_uuid, client_name, roles=resolved_roles)
     new_refresh_token = create_refresh_token(client_uuid, client_name, roles=resolved_roles)
-    redis_store.register_client(str(client_uuid), client_name, last_token_jti=access_token.jti)
+
+    try:
+        redis_store.register_client(str(client_uuid), client_name, access_token.token)
+    except (RedisUnavailableError, RedisOperationError) as exc:
+        logger.warning(
+            "Unable to record client %s (%s) during refresh rotation: %s",
+            client_name,
+            client_uuid,
+            exc,
+        )
 
     audit_logger.info(
         "Rotated refresh token",
@@ -280,7 +273,7 @@ def rotate_refresh_token(refresh_token: str) -> Optional[dict]:
     }
 
 
-def revoke_token(token: Optional[str] = None, jti: Optional[str] = None) -> bool:
+def revoke_token(token: str | None = None, jti: str | None = None) -> bool:
     """Revoke a token using its encoded value or identifier."""
 
     resolved_jti = jti
@@ -295,18 +288,36 @@ def revoke_token(token: Optional[str] = None, jti: Optional[str] = None) -> bool
     if not resolved_jti:
         return False
 
-    revoked = redis_store.revoke_token(resolved_jti)
+    try:
+        revoked = redis_store.revoke_token(resolved_jti)
+    except RedisUnavailableError as exc:
+        revoked = bool(exc.fallback_result)
+        logger.warning("Redis unavailable while revoking token %s: %s", resolved_jti, exc)
+    except RedisOperationError as exc:
+        logger.error("Redis error revoking token %s: %s", resolved_jti, exc)
+        return False
+
     if revoked:
         audit_logger.info("Token revoked", extra={"jti": resolved_jti})
     return revoked
 
 
-def revoke_client_tokens(client_uuid: UUID, token_type: Optional[str] = None) -> int:
+def revoke_client_tokens(client_uuid: UUID, token_type: str | None = None) -> int:
     """Revoke all tokens for a client, optionally filtering by token type."""
 
-    revoked_count = redis_store.revoke_client_tokens(str(client_uuid), token_type)
+    try:
+        revoked_count = redis_store.revoke_client_tokens(str(client_uuid), token_type)
+    except RedisUnavailableError as exc:
+        revoked_count = int(exc.fallback_result or 0)
+        logger.warning("Redis unavailable while revoking tokens for %s: %s", client_uuid, exc)
+    except RedisOperationError as exc:
+        logger.error("Redis error revoking tokens for %s: %s", client_uuid, exc)
+        return 0
+
     if revoked_count:
         audit_logger.info(
-            "Revoked %s token(s) for client", revoked_count, extra={"client_uuid": str(client_uuid)}
+            "Revoked %s token(s) for client",
+            revoked_count,
+            extra={"client_uuid": str(client_uuid), "token_type": token_type},
         )
     return revoked_count

@@ -1,11 +1,13 @@
 """WebSocket connection manager for handling client connections and message routing."""
-from fastapi import WebSocket
+from __future__ import annotations
+
 import asyncio
+import logging
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Optional
 from uuid import UUID
-import logging
+
+from fastapi import WebSocket
 
 from redis_store import RedisUnavailableError, redis_store
 
@@ -40,7 +42,6 @@ class ConnectionManager:
         # Dictionary mapping client UUID to WebSocket connection (in-memory)
         self.active_connections: dict[str, WebSocket] = {}
         # Fallback dictionary for client names (when Redis is unavailable)
-        self.client_names: dict[str, str] = {}
         self.client_names: dict[str, str] = {}
         # Pending deliveries awaiting acknowledgment
         self.pending_deliveries: dict[str, PendingDelivery] = {}
@@ -161,7 +162,7 @@ class ConnectionManager:
         
         Args:
             message: Message dictionary
-            exclude: Optional UUID to exclude from broadcast
+            exclude: UUID to exclude from broadcast when provided
         """
         exclude_str = str(exclude) if exclude else None
         
@@ -256,7 +257,7 @@ class ConnectionManager:
         Args:
             topic_id: Topic identifier
             message: Message dictionary
-            exclude: Optional UUID to exclude from broadcast
+            exclude: UUID to exclude from broadcast when provided
         """
         # Get topic subscribers from Redis
         try:
