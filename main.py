@@ -9,7 +9,6 @@ This server provides:
 """
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
 from fastapi.responses import JSONResponse
-from typing import Optional
 from uuid import UUID
 import json
 import time

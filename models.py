@@ -1,10 +1,9 @@
-"""
-Data models for the WebSocket messaging server.
-"""
-from pydantic import BaseModel, Field, ConfigDict
-from typing import Optional
+"""Data models for the WebSocket messaging server."""
+
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field
 from uuid import UUID
-from datetime import datetime
 
 
 class ClientRegistration(BaseModel):
@@ -44,8 +43,13 @@ class MessageAcknowledgment(BaseModel):
 
 class TopicCreate(BaseModel):
     """Model for creating a new topic/room."""
-    topic_id: str = Field(..., description="Topic identifier (routable)", min_length=1, max_length=100)
-    metadata: Optional[dict] = Field(default={}, description="Optional topic metadata")
+
+    topic_id: str = Field(
+        ..., description="Topic identifier (routable)", min_length=1, max_length=100
+    )
+    metadata: dict[str, Any] = Field(
+        default_factory=dict, description="Optional topic metadata"
+    )
 
 
 class TopicSubscribe(BaseModel):

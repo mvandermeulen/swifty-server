@@ -7,7 +7,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable
 
 import redis
 
@@ -43,20 +43,20 @@ class TopicData:
 
     id: str
     creator: str
-    metadata: Dict[str, Any]
+    metadata: dict[str, Any]
 
 
 class InMemoryFallbackStore:
     """Simple in-memory data store that mirrors Redis operations."""
 
     def __init__(self) -> None:
-        self.clients: Dict[str, Dict[str, Any]] = {}
-        self.tokens: Dict[str, str] = {}
-        self.client_metadata: Dict[str, Dict[str, Any]] = {}
-        self.connected_clients: Dict[str, str] = {}
-        self.topics: Dict[str, TopicData] = {}
-        self.topic_subscribers: Dict[str, Set[str]] = {}
-        self.client_topics: Dict[str, Set[str]] = {}
+        self.clients: dict[str, dict[str, Any]] = {}
+        self.tokens: dict[str, str] = {}
+        self.client_metadata: dict[str, dict[str, Any]] = {}
+        self.connected_clients: dict[str, str] = {}
+        self.topics: dict[str, TopicData] = {}
+        self.topic_subscribers: dict[str, set[str]] = {}
+        self.client_topics: dict[str, set[str]] = {}
 
     # Client management -------------------------------------------------
     def register_client(self, client_uuid: str, client_name: str, token: str) -> bool:
@@ -69,18 +69,18 @@ class InMemoryFallbackStore:
             self.tokens[token] = client_uuid
         return True
 
-    def get_client_by_uuid(self, client_uuid: str) -> Optional[Dict[str, Any]]:
+    def get_client_by_uuid(self, client_uuid: str) -> dict[str, Any] | None:
         data = self.clients.get(client_uuid)
         return dict(data) if data else None
 
-    def get_client_by_token(self, token: str) -> Optional[str]:
+    def get_client_by_token(self, token: str) -> str | None:
         return self.tokens.get(token)
 
-    def update_client_metadata(self, client_uuid: str, metadata: Dict[str, Any]) -> bool:
+    def update_client_metadata(self, client_uuid: str, metadata: dict[str, Any]) -> bool:
         self.client_metadata[client_uuid] = dict(metadata)
         return True
 
-    def get_client_metadata(self, client_uuid: str) -> Optional[Dict[str, Any]]:
+    def get_client_metadata(self, client_uuid: str) -> dict[str, Any] | None:
         metadata = self.client_metadata.get(client_uuid)
         return dict(metadata) if metadata is not None else None
 
@@ -93,7 +93,7 @@ class InMemoryFallbackStore:
         self.connected_clients.pop(client_uuid, None)
         return True
 
-    def get_connected_clients(self) -> Dict[str, str]:
+    def get_connected_clients(self) -> dict[str, str]:
         return dict(self.connected_clients)
 
     def is_client_connected(self, client_uuid: str) -> bool:
@@ -101,7 +101,7 @@ class InMemoryFallbackStore:
 
     # Topic management --------------------------------------------------
     def create_topic(
-        self, topic_id: str, creator_uuid: str, metadata: Optional[Dict[str, Any]] = None
+        self, topic_id: str, creator_uuid: str, metadata: dict[str, Any] | None = None
     ) -> bool:
         if topic_id in self.topics:
             return False
@@ -113,7 +113,7 @@ class InMemoryFallbackStore:
         self.topic_subscribers.setdefault(topic_id, set())
         return True
 
-    def get_topic(self, topic_id: str) -> Optional[Dict[str, Any]]:
+    def get_topic(self, topic_id: str) -> dict[str, Any] | None:
         topic = self.topics.get(topic_id)
         if not topic:
             return None
@@ -123,7 +123,7 @@ class InMemoryFallbackStore:
             "metadata": dict(topic.metadata),
         }
 
-    def list_topics(self) -> List[str]:
+    def list_topics(self) -> list[str]:
         return list(self.topics.keys())
 
     def delete_topic(self, topic_id: str) -> bool:
@@ -152,10 +152,10 @@ class InMemoryFallbackStore:
             self.client_topics[client_uuid].discard(topic_id)
         return True
 
-    def get_topic_subscribers(self, topic_id: str) -> Set[str]:
+    def get_topic_subscribers(self, topic_id: str) -> set[str]:
         return set(self.topic_subscribers.get(topic_id, set()))
 
-    def get_client_topics(self, client_uuid: str) -> Set[str]:
+    def get_client_topics(self, client_uuid: str) -> set[str]:
         return set(self.client_topics.get(client_uuid, set()))
 
     # Cleanup -----------------------------------------------------------
@@ -168,7 +168,7 @@ class InMemoryFallbackStore:
         return True
 
     # Snapshot ----------------------------------------------------------
-    def snapshot(self) -> Dict[str, Any]:
+    def snapshot(self) -> dict[str, Any]:
         return {
             "clients": {uuid: dict(data) for uuid, data in self.clients.items()},
             "tokens": dict(self.tokens),
@@ -197,7 +197,7 @@ class RedisStore:
     """Redis repository with retry logic, circuit breaking, and fallback support."""
 
     def __init__(self) -> None:
-        self._client: Optional[redis.Redis] = None
+        self._client: redis.Redis | None = None
         self._max_retries = int(os.getenv("REDIS_MAX_RETRIES", "3"))
         self._retry_backoff = float(os.getenv("REDIS_RETRY_BACKOFF", "0.2"))
         self._health_check_interval = float(os.getenv("REDIS_HEALTH_INTERVAL", "5"))
@@ -253,7 +253,7 @@ class RedisStore:
         self._connect()
         return bool(self._client)
 
-    def check_health(self) -> Dict[str, Any]:
+    def check_health(self) -> dict[str, Any]:
         """Return health information and attempt to close the circuit when possible."""
         available = self._ensure_connection()
         status = "available" if available else "degraded"
@@ -270,7 +270,7 @@ class RedisStore:
                 f"Redis unavailable during {description}; using fallback store instead."
             )
 
-        last_error: Optional[BaseException] = None
+        last_error: BaseException | None = None
         for attempt in range(1, self._max_retries + 1):
             try:
                 return operation()
@@ -363,10 +363,10 @@ class RedisStore:
             self._backfill_needed = True
             raise RedisUnavailableError(exc.args[0], fallback_result=True) from exc
 
-    def get_client_by_uuid(self, client_uuid: str) -> Optional[Dict[str, Any]]:
+    def get_client_by_uuid(self, client_uuid: str) -> dict[str, Any] | None:
         fallback_value = self.fallback.get_client_by_uuid(client_uuid)
         try:
-            def op() -> Optional[Dict[str, Any]]:
+            def op() -> dict[str, Any] | None:
                 data = self._client.hgetall(f"client:{client_uuid}")
                 return data or None
 
@@ -378,10 +378,10 @@ class RedisStore:
         except RedisUnavailableError as exc:
             raise RedisUnavailableError(exc.args[0], fallback_result=fallback_value) from exc
 
-    def get_client_by_token(self, token: str) -> Optional[str]:
+    def get_client_by_token(self, token: str) -> str | None:
         fallback_value = self.fallback.get_client_by_token(token)
         try:
-            def op() -> Optional[str]:
+            def op() -> str | None:
                 return self._client.get(f"token:{token}")
 
             result = self._execute(op, description="get_client_by_token")
@@ -393,7 +393,7 @@ class RedisStore:
         except RedisUnavailableError as exc:
             raise RedisUnavailableError(exc.args[0], fallback_result=fallback_value) from exc
 
-    def update_client_metadata(self, client_uuid: str, metadata: Dict[str, Any]) -> bool:
+    def update_client_metadata(self, client_uuid: str, metadata: dict[str, Any]) -> bool:
         self.fallback.update_client_metadata(client_uuid, metadata)
         try:
             def op() -> bool:
@@ -406,10 +406,10 @@ class RedisStore:
             self._backfill_needed = True
             raise RedisUnavailableError(exc.args[0], fallback_result=True) from exc
 
-    def get_client_metadata(self, client_uuid: str) -> Optional[Dict[str, Any]]:
+    def get_client_metadata(self, client_uuid: str) -> dict[str, Any] | None:
         fallback_value = self.fallback.get_client_metadata(client_uuid)
         try:
-            def op() -> Optional[Dict[str, Any]]:
+            def op() -> dict[str, Any] | None:
                 data = self._client.get(f"client:{client_uuid}:metadata")
                 return json.loads(data) if data else None
 
@@ -443,10 +443,10 @@ class RedisStore:
             self._backfill_needed = True
             raise RedisUnavailableError(exc.args[0], fallback_result=True) from exc
 
-    def get_connected_clients(self) -> Dict[str, str]:
+    def get_connected_clients(self) -> dict[str, str]:
         fallback_value = self.fallback.get_connected_clients()
         try:
-            def op() -> Dict[str, str]:
+            def op() -> dict[str, str]:
                 return self._client.hgetall("connected_clients")
 
             return self._execute(op, description="get_connected_clients")
@@ -464,7 +464,7 @@ class RedisStore:
             raise RedisUnavailableError(exc.args[0], fallback_result=fallback_value) from exc
 
     def create_topic(
-        self, topic_id: str, creator_uuid: str, metadata: Optional[Dict[str, Any]] = None
+        self, topic_id: str, creator_uuid: str, metadata: dict[str, Any] | None = None
     ) -> bool:
         created = self.fallback.create_topic(topic_id, creator_uuid, metadata)
         if not created:
@@ -491,10 +491,10 @@ class RedisStore:
             self._backfill_needed = True
             raise RedisUnavailableError(exc.args[0], fallback_result=True) from exc
 
-    def get_topic(self, topic_id: str) -> Optional[Dict[str, Any]]:
+    def get_topic(self, topic_id: str) -> dict[str, Any] | None:
         fallback_value = self.fallback.get_topic(topic_id)
         try:
-            def op() -> Optional[Dict[str, Any]]:
+            def op() -> dict[str, Any] | None:
                 topic_key = f"topic:{topic_id}"
                 data = self._client.hgetall(topic_key)
                 if data and "metadata" in data:
@@ -505,10 +505,10 @@ class RedisStore:
         except RedisUnavailableError as exc:
             raise RedisUnavailableError(exc.args[0], fallback_result=fallback_value) from exc
 
-    def list_topics(self) -> List[str]:
+    def list_topics(self) -> list[str]:
         fallback_value = self.fallback.list_topics()
         try:
-            def op() -> List[str]:
+            def op() -> list[str]:
                 topics = self._client.smembers("topics")
                 return list(topics) if topics else []
 
@@ -566,10 +566,10 @@ class RedisStore:
             self._backfill_needed = True
             raise RedisUnavailableError(exc.args[0], fallback_result=unsubscribed) from exc
 
-    def get_topic_subscribers(self, topic_id: str) -> Set[str]:
+    def get_topic_subscribers(self, topic_id: str) -> set[str]:
         fallback_value = self.fallback.get_topic_subscribers(topic_id)
         try:
-            def op() -> Set[str]:
+            def op() -> set[str]:
                 subscribers = self._client.smembers(f"topic:{topic_id}:subscribers")
                 return set(subscribers) if subscribers else set()
 
@@ -577,10 +577,10 @@ class RedisStore:
         except RedisUnavailableError as exc:
             raise RedisUnavailableError(exc.args[0], fallback_result=fallback_value) from exc
 
-    def get_client_topics(self, client_uuid: str) -> Set[str]:
+    def get_client_topics(self, client_uuid: str) -> set[str]:
         fallback_value = self.fallback.get_client_topics(client_uuid)
         try:
-            def op() -> Set[str]:
+            def op() -> set[str]:
                 topics = self._client.smembers(f"client:{client_uuid}:topics")
                 return set(topics) if topics else set()
 

@@ -2,7 +2,6 @@
 WebSocket connection manager for handling client connections and message routing.
 """
 from fastapi import WebSocket
-from typing import Dict, Optional, Set
 from uuid import UUID
 import json
 import logging
@@ -18,9 +17,9 @@ class ConnectionManager:
     
     def __init__(self):
         # Dictionary mapping client UUID to WebSocket connection (in-memory)
-        self.active_connections: Dict[str, WebSocket] = {}
+        self.active_connections: dict[str, WebSocket] = {}
         # Fallback dictionary for client names (when Redis is unavailable)
-        self.client_names: Dict[str, str] = {}
+        self.client_names: dict[str, str] = {}
     
     async def connect(self, websocket: WebSocket, client_uuid: UUID, client_name: str):
         """
@@ -99,7 +98,7 @@ class ConnectionManager:
             logger.warning(f"Recipient {recipient_uuid_str} not connected")
             return False
     
-    async def broadcast(self, message: dict, exclude: Optional[UUID] = None):
+    async def broadcast(self, message: dict, exclude: UUID | None = None):
         """
         Broadcast a message to all connected clients.
         
@@ -132,7 +131,7 @@ class ConnectionManager:
         """
         return str(client_uuid) in self.active_connections
     
-    def get_connected_clients(self) -> Dict[str, str]:
+    def get_connected_clients(self) -> dict[str, str]:
         """
         Get a dictionary of all connected clients.
         
@@ -150,7 +149,9 @@ class ConnectionManager:
             logger.warning("Redis unavailable when listing clients: %s", exc)
         return self.client_names.copy()
     
-    async def broadcast_to_topic(self, topic_id: str, message: dict, exclude: Optional[UUID] = None):
+    async def broadcast_to_topic(
+        self, topic_id: str, message: dict, exclude: UUID | None = None
+    ):
         """
         Broadcast a message to all subscribers of a topic.
         

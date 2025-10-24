@@ -2,7 +2,6 @@
 JWT authentication utilities.
 """
 from datetime import datetime, timedelta, timezone
-from typing import Optional
 from jose import JWTError, jwt
 from uuid import UUID
 import os
@@ -18,7 +17,9 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
 
-def create_access_token(client_uuid: UUID, client_name: str, expires_delta: Optional[timedelta] = None) -> str:
+def create_access_token(
+    client_uuid: UUID, client_name: str, expires_delta: timedelta | None = None
+) -> str:
     """
     Create a JWT access token for a client.
     
@@ -52,7 +53,7 @@ def create_access_token(client_uuid: UUID, client_name: str, expires_delta: Opti
     return encoded_jwt
 
 
-def verify_token(token: str) -> Optional[dict]:
+def verify_token(token: str) -> dict | None:
     """
     Verify and decode a JWT token.
     
