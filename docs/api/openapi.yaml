@@ -1,0 +1,381 @@
+openapi: 3.1.0
+info:
+  title: Swifty Server REST API
+  description: |
+    Contract for the HTTP endpoints exposed by the Swifty Server deployment.
+
+    The API issues JWTs used to authenticate WebSocket sessions and provides
+    topic lifecycle management. See the complementary AsyncAPI document for
+    streaming semantics.
+  version: 1.1.0
+  x-release-status: stable
+  x-compatibility:
+    default-versioning: semver
+    stability-policy: |
+      Minor version bumps (<major>.<minor+>) may add optional request fields or
+      response properties. Breaking changes are reserved for major version
+      increments and require a six week deprecation window announced through the
+      /status endpoint and release notes.
+    negotiation-guidelines:
+      - Always include the Accept header with the desired version range. When
+        omitted, the server defaults to the latest minor version for the current
+        major release.
+      - Clients should gracefully ignore unknown response properties to remain
+        forward compatible.
+servers:
+  - url: https://api.swifty.example.com
+    description: Production server
+  - url: https://staging.api.swifty.example.com
+    description: Staging server for integration testing
+paths:
+  /:
+    get:
+      summary: Get API metadata
+      operationId: getMetadata
+      responses:
+        "200":
+          description: Metadata describing the deployment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MetadataResponse'
+  /register:
+    post:
+      summary: Register a client and receive a JWT token
+      operationId: registerClient
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClientRegistration'
+      responses:
+        "200":
+          description: Registration succeeded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegistrationResponse'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "500":
+          $ref: '#/components/responses/ServerError'
+  /clients:
+    get:
+      summary: List connected clients
+      operationId: listClients
+      responses:
+        "200":
+          description: Snapshot of currently connected clients.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClientListResponse'
+  /topics:
+    get:
+      summary: List all topics
+      operationId: listTopics
+      responses:
+        "200":
+          description: Collection of topics with metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TopicListResponse'
+  /topics/create:
+    post:
+      summary: Create a topic
+      operationId: createTopic
+      parameters:
+        - $ref: '#/components/parameters/AuthToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TopicCreate'
+      responses:
+        "200":
+          description: Topic created successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TopicCreateResponse'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "500":
+          $ref: '#/components/responses/ServerError'
+  /topics/subscribe:
+    post:
+      summary: Subscribe to a topic
+      operationId: subscribeTopic
+      parameters:
+        - $ref: '#/components/parameters/AuthToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TopicSubscribe'
+      responses:
+        "200":
+          description: Subscription registered.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TopicSubscribeResponse'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "500":
+          $ref: '#/components/responses/ServerError'
+  /topics/unsubscribe:
+    post:
+      summary: Unsubscribe from a topic
+      operationId: unsubscribeTopic
+      parameters:
+        - $ref: '#/components/parameters/AuthToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TopicSubscribe'
+      responses:
+        "200":
+          description: Subscription removed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TopicUnsubscribeResponse'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "500":
+          $ref: '#/components/responses/ServerError'
+  /topics/{topic_id}:
+    get:
+      summary: Inspect a topic
+      operationId: getTopic
+      parameters:
+        - name: topic_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Topic identifier
+      responses:
+        "200":
+          description: Topic descriptor
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TopicDetailResponse'
+        "404":
+          $ref: '#/components/responses/NotFound'
+components:
+  parameters:
+    AuthToken:
+      name: token
+      in: query
+      required: true
+      schema:
+        type: string
+      description: JWT obtained from /register
+  responses:
+    BadRequest:
+      description: The request payload was invalid.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Unauthorized:
+      description: Authentication failed or token is missing.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound:
+      description: Resource does not exist.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    ServerError:
+      description: Unexpected server-side error.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+  schemas:
+    MetadataResponse:
+      type: object
+      required:
+        - message
+        - version
+        - endpoints
+      properties:
+        message:
+          type: string
+        version:
+          type: string
+        endpoints:
+          type: object
+          additionalProperties:
+            type: string
+    ClientRegistration:
+      type: object
+      required:
+        - name
+        - uuid
+      properties:
+        name:
+          type: string
+        uuid:
+          type: string
+          format: uuid
+    RegistrationResponse:
+      type: object
+      required:
+        - token
+        - uuid
+        - name
+        - message
+      properties:
+        token:
+          type: string
+        uuid:
+          type: string
+          format: uuid
+        name:
+          type: string
+        message:
+          type: string
+    ClientListResponse:
+      type: object
+      required:
+        - count
+        - clients
+      properties:
+        count:
+          type: integer
+          minimum: 0
+        clients:
+          type: object
+          additionalProperties:
+            type: string
+    TopicCreate:
+      type: object
+      required:
+        - topic_id
+      properties:
+        topic_id:
+          type: string
+          minLength: 1
+          maxLength: 100
+        metadata:
+          type: object
+          additionalProperties: true
+      description: Mirrors TopicCreate model in the service.
+    TopicCreateResponse:
+      type: object
+      required:
+        - message
+        - topic_id
+        - creator
+      properties:
+        message:
+          type: string
+        topic_id:
+          type: string
+        creator:
+          type: string
+          format: uuid
+    TopicSubscribe:
+      type: object
+      required:
+        - topic_id
+      properties:
+        topic_id:
+          type: string
+    TopicSubscribeResponse:
+      type: object
+      required:
+        - message
+        - topic_id
+        - client_uuid
+      properties:
+        message:
+          type: string
+        topic_id:
+          type: string
+        client_uuid:
+          type: string
+          format: uuid
+    TopicUnsubscribeResponse:
+      allOf:
+        - $ref: '#/components/schemas/TopicSubscribeResponse'
+    TopicSummary:
+      type: object
+      required:
+        - id
+        - creator
+        - metadata
+        - subscriber_count
+      properties:
+        id:
+          type: string
+        creator:
+          type: string
+          format: uuid
+        metadata:
+          type: object
+          additionalProperties: true
+        subscriber_count:
+          type: integer
+          minimum: 0
+    TopicListResponse:
+      type: object
+      required:
+        - count
+        - topics
+      properties:
+        count:
+          type: integer
+        topics:
+          type: array
+          items:
+            $ref: '#/components/schemas/TopicSummary'
+    TopicDetailResponse:
+      allOf:
+        - $ref: '#/components/schemas/TopicSummary'
+        - type: object
+          required:
+            - subscribers
+          properties:
+            subscribers:
+              type: array
+              items:
+                type: string
+                format: uuid
+    ErrorResponse:
+      type: object
+      required:
+        - type
+        - message
+      properties:
+        type:
+          type: string
+          enum:
+            - error
+        message:
+          type: string
+        timestamp:
+          type: number
+          format: double
+        detail:
+          description: Optional structured error detail.
+          type: object
+          additionalProperties: true
