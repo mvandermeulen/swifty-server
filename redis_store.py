@@ -5,7 +5,9 @@ import redis
 import json
 import os
 import logging
-from typing import Dict, List, Optional, Set
+import time
+from collections import defaultdict
+from typing import Any, Dict, List, Optional, Set
 from uuid import UUID
 
 logger = logging.getLogger(__name__)
@@ -36,6 +38,12 @@ class RedisStore:
         except redis.ConnectionError as e:
             logger.warning(f"Redis connection failed: {e}. Using in-memory fallback.")
             self.client = None
+
+        # In-memory fallbacks for environments without Redis
+        self._offline_queues: Dict[str, List[dict]] = defaultdict(list)
+        self._delivery_status: Dict[str, Dict[str, Any]] = {}
+        self._recipient_index: Dict[str, Set[str]] = defaultdict(set)
+        self._sender_index: Dict[str, Set[str]] = defaultdict(set)
     
     # Client Management
     
@@ -221,21 +229,201 @@ class RedisStore:
     def is_client_connected(self, client_uuid: str) -> bool:
         """
         Check if a client is connected.
-        
+
         Args:
             client_uuid: Client's UUID
-            
+
         Returns:
             True if connected
         """
         if not self.client:
             return False
-        
+
         try:
             return self.client.hexists("connected_clients", client_uuid)
         except Exception as e:
             logger.error(f"Error checking client connection: {e}")
             return False
+
+    # Message Queue and Delivery Tracking
+
+    def enqueue_offline_message(self, recipient_uuid: str, message: Dict) -> bool:
+        """Persist a message for an offline recipient."""
+        if not message:
+            return False
+
+        if not self.client:
+            self._offline_queues[recipient_uuid].append(message.copy())
+            return True
+
+        try:
+            queue_key = f"offline:{recipient_uuid}"
+            self.client.rpush(queue_key, json.dumps(message))
+            return True
+        except Exception as e:
+            logger.error(f"Error queueing offline message: {e}")
+            return False
+
+    def pop_offline_messages(self, recipient_uuid: str) -> List[Dict]:
+        """Retrieve and remove queued messages for a recipient."""
+        if not self.client:
+            messages = self._offline_queues.pop(recipient_uuid, [])
+            return [msg.copy() for msg in messages]
+
+        queue_key = f"offline:{recipient_uuid}"
+        try:
+            messages = self.client.lrange(queue_key, 0, -1)
+            if messages:
+                self.client.delete(queue_key)
+            return [json.loads(item) for item in messages]
+        except Exception as e:
+            logger.error(f"Error retrieving offline messages: {e}")
+            return []
+
+    def record_delivery_attempt(self, msgid: str, metadata: Dict[str, Any]) -> None:
+        """Record metadata for a delivery attempt."""
+        metadata = metadata.copy()
+        metadata.setdefault("msgid", msgid)
+        metadata.setdefault("attempts", 0)
+        metadata.setdefault("status", "created")
+        metadata.setdefault("last_update", time.time())
+
+        if not self.client:
+            self._delivery_status[msgid] = metadata
+            recipient = metadata.get("recipient")
+            sender = metadata.get("sender")
+            if recipient:
+                self._recipient_index[recipient].add(msgid)
+            if sender:
+                self._sender_index[sender].add(msgid)
+            return
+
+        key = f"delivery:{msgid}"
+        try:
+            self.client.hset(key, mapping={k: json.dumps(v) if isinstance(v, (dict, list)) else v for k, v in metadata.items()})
+            recipient = metadata.get("recipient")
+            sender = metadata.get("sender")
+            if recipient:
+                self.client.sadd(f"recipient:{recipient}:messages", msgid)
+            if sender:
+                self.client.sadd(f"sender:{sender}:messages", msgid)
+        except Exception as e:
+            logger.error(f"Error recording delivery attempt: {e}")
+
+    def update_delivery_status(self, msgid: str, status: str, **fields: Any) -> None:
+        """Update the status and metadata of a delivery."""
+        update = {"status": status, "last_update": time.time()}
+        update.update(fields)
+
+        if not self.client:
+            current = self._delivery_status.get(msgid, {})
+            current.update(update)
+            self._delivery_status[msgid] = current
+            if status in {"delivered", "failed"}:
+                recipient = current.get("recipient")
+                if recipient and msgid in self._recipient_index.get(recipient, set()):
+                    self._recipient_index[recipient].discard(msgid)
+            return
+
+        key = f"delivery:{msgid}"
+        try:
+            mapping = {k: json.dumps(v) if isinstance(v, (dict, list)) else v for k, v in update.items()}
+            self.client.hset(key, mapping=mapping)
+
+            if status in {"delivered", "failed"}:
+                data = self.client.hgetall(key)
+                recipient = data.get("recipient")
+                if recipient:
+                    self.client.srem(f"recipient:{recipient}:messages", msgid)
+        except Exception as e:
+            logger.error(f"Error updating delivery status: {e}")
+
+    def get_delivery_status(self, msgid: str) -> Optional[Dict[str, Any]]:
+        """Fetch delivery metadata for a message."""
+        if not self.client:
+            record = self._delivery_status.get(msgid)
+            return record.copy() if record else None
+
+        key = f"delivery:{msgid}"
+        try:
+            data = self.client.hgetall(key)
+            if not data:
+                return None
+            result: Dict[str, Any] = {}
+            for k, v in data.items():
+                try:
+                    result[k] = json.loads(v)
+                except (TypeError, json.JSONDecodeError):
+                    result[k] = v
+            return result
+        except Exception as e:
+            logger.error(f"Error retrieving delivery status: {e}")
+            return None
+
+    def list_undelivered_messages(self, client_uuid: str) -> List[Dict[str, Any]]:
+        """List delivery records that are not yet completed for a client."""
+        messages: List[Dict[str, Any]] = []
+
+        if not self.client:
+            msgids = list(self._recipient_index.get(client_uuid, set()))
+            for msgid in msgids:
+                record = self._delivery_status.get(msgid)
+                if record and record.get("status") not in {"delivered", "failed"}:
+                    messages.append(record.copy())
+            return messages
+
+        set_key = f"recipient:{client_uuid}:messages"
+        try:
+            msgids = self.client.smembers(set_key)
+            for msgid in msgids:
+                record = self.get_delivery_status(msgid)
+                if record and record.get("status") not in {"delivered", "failed"}:
+                    messages.append(record)
+            return messages
+        except Exception as e:
+            logger.error(f"Error listing undelivered messages: {e}")
+            return []
+
+    def get_delivery_metrics(self) -> Dict[str, int]:
+        """Aggregate delivery metrics for monitoring."""
+        metrics = {"total": 0, "delivered": 0, "pending": 0, "queued": 0, "failed": 0}
+
+        if not self.client:
+            for record in self._delivery_status.values():
+                metrics["total"] += 1
+                status = record.get("status", "pending")
+                if status in {"delivered", "failed", "queued", "pending", "pending_ack", "retrying"}:
+                    if status == "delivered":
+                        metrics["delivered"] += 1
+                    elif status == "failed":
+                        metrics["failed"] += 1
+                    elif status in {"queued", "queued_offline"}:
+                        metrics["queued"] += 1
+                    else:
+                        metrics["pending"] += 1
+                else:
+                    metrics["pending"] += 1
+            return metrics
+
+        try:
+            for key in self.client.scan_iter(match="delivery:*"):
+                metrics["total"] += 1
+                record = self.get_delivery_status(key.split(":", 1)[1])
+                if not record:
+                    continue
+                status = record.get("status", "pending")
+                if status == "delivered":
+                    metrics["delivered"] += 1
+                elif status == "failed":
+                    metrics["failed"] += 1
+                elif status in {"queued", "queued_offline"}:
+                    metrics["queued"] += 1
+                else:
+                    metrics["pending"] += 1
+            return metrics
+        except Exception as e:
+            logger.error(f"Error calculating delivery metrics: {e}")
+            return metrics
     
     # Topic/Room Management
     

@@ -48,7 +48,10 @@ async def root():
             "topics": "/topics",
             "create_topic": "/topics/create",
             "subscribe": "/topics/subscribe",
-            "unsubscribe": "/topics/unsubscribe"
+            "unsubscribe": "/topics/unsubscribe",
+            "delivery_status": "/messages/{msgid}/status",
+            "undelivered": "/clients/{uuid}/undelivered",
+            "delivery_metrics": "/delivery/metrics"
         }
     }
 
@@ -85,7 +88,7 @@ async def register_client(registration: ClientRegistration):
 async def get_clients():
     """
     Get list of currently connected clients.
-    
+
     Returns:
         Dictionary of connected clients (UUID -> name)
     """
@@ -94,6 +97,52 @@ async def get_clients():
         "count": len(clients),
         "clients": clients
     }
+
+
+@app.get("/messages/{msgid}/status")
+async def get_message_status(msgid: UUID, token: str = Query(..., description="JWT authentication token")):
+    """Return delivery metadata for a specific message."""
+    payload = verify_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    status = redis_store.get_delivery_status(str(msgid))
+    if not status:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    requester_uuid = payload["sub"]
+    if requester_uuid not in {status.get("sender"), status.get("recipient")}:
+        raise HTTPException(status_code=403, detail="Not authorized to view this message")
+
+    return status
+
+
+@app.get("/clients/{client_uuid}/undelivered")
+async def get_undelivered_messages(client_uuid: UUID, token: str = Query(..., description="JWT authentication token")):
+    """List undelivered messages for a client."""
+    payload = verify_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    if str(client_uuid) != payload["sub"]:
+        raise HTTPException(status_code=403, detail="Cannot query undelivered messages for other clients")
+
+    messages = redis_store.list_undelivered_messages(str(client_uuid))
+    return {
+        "count": len(messages),
+        "messages": messages
+    }
+
+
+@app.get("/delivery/metrics")
+async def get_delivery_metrics(token: str = Query(..., description="JWT authentication token")):
+    """Expose aggregate delivery metrics."""
+    payload = verify_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    metrics = redis_store.get_delivery_metrics()
+    return metrics
 
 
 @app.post("/topics/create")
@@ -303,7 +352,41 @@ async def websocket_endpoint(
             
             try:
                 message_data = json.loads(data)
-                
+
+                # Handle delivery acknowledgments
+                if message_data.get("type") == "ack":
+                    try:
+                        acknowledgment = MessageAcknowledgment(**message_data)
+                    except Exception as validation_error:
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": f"Invalid acknowledgment format: {validation_error}",
+                            "timestamp": time.time()
+                        })
+                        continue
+
+                    if acknowledgment.from_ != client_uuid:
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "Acknowledgment sender mismatch",
+                            "timestamp": time.time()
+                        })
+                        continue
+
+                    await manager.handle_acknowledgment(
+                        str(acknowledgment.msgid),
+                        acknowledgment.status,
+                        str(client_uuid)
+                    )
+
+                    await websocket.send_json({
+                        "type": "ack_received",
+                        "msgid": str(acknowledgment.msgid),
+                        "status": acknowledgment.status,
+                        "timestamp": time.time()
+                    })
+                    continue
+
                 # Check if this is a topic message
                 if "topic_id" in message_data:
                     # Handle topic message
@@ -382,34 +465,21 @@ async def websocket_endpoint(
                             "timestamp": time.time()
                         })
                         continue
-                    
+
                     # Route message to recipient
-                    success = await manager.send_message(
+                    delivery_result = await manager.send_message(
                         message_data,
                         message.to
                     )
-                    
-                    # Send confirmation to sender
-                    if success:
-                        await websocket.send_json({
-                            "type": "sent",
-                            "message": "Message delivered",
-                            "msgid": str(message.msgid),
-                            "timestamp": time.time()
-                        })
-                    else:
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": f"Recipient {message.to} not connected",
-                            "msgid": str(message.msgid),
-                            "timestamp": time.time()
-                        })
-                    
-                    # Handle acknowledgment if required
-                    if message.acknowledge:
-                        # The recipient should send an acknowledgment
-                        # This is handled by the recipient's client logic
-                        pass
+
+                    await websocket.send_json({
+                        "type": "delivery_status",
+                        "status": delivery_result.status,
+                        "message": delivery_result.detail,
+                        "msgid": str(message.msgid),
+                        "timestamp": time.time(),
+                        "acknowledge": message.acknowledge,
+                    })
                     
             except json.JSONDecodeError:
                 await websocket.send_json({

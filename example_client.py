@@ -79,11 +79,20 @@ class SwiftyClient:
             async for message in self.ws:
                 data = json.loads(message)
                 print(f"\n📨 Received: {json.dumps(data, indent=2)}")
+
+                # Automatically acknowledge messages that request delivery confirmation
+                if (
+                    isinstance(data, dict)
+                    and data.get("acknowledge")
+                    and data.get("type") not in {"ack", "ack_received", "delivery_update"}
+                    and "msgid" in data
+                ):
+                    await self.send_ack(data["msgid"])
         except websockets.exceptions.ConnectionClosed:
             print("\n✗ Connection closed")
         except Exception as e:
             print(f"\n✗ Error receiving messages: {e}")
-    
+
     async def send_message(self, to_uuid: str, content: str, **kwargs):
         """
         Send a message to another client.
@@ -111,6 +120,22 @@ class SwiftyClient:
         
         print(f"\n📤 Sending message to {to_uuid}...")
         await self.ws.send(json.dumps(message))
+
+    async def send_ack(self, msgid: str, status: str = "delivered"):
+        """Send an acknowledgment for a received message."""
+        if not self.ws:
+            return
+
+        ack_payload = {
+            "type": "ack",
+            "msgid": msgid,
+            "from": str(self.uuid),
+            "timestamp": time.time(),
+            "status": status,
+        }
+
+        print(f"\n✅ Sending acknowledgment for {msgid} with status '{status}'")
+        await self.ws.send(json.dumps(ack_payload))
     
     async def run_interactive(self):
         """Run client in interactive mode."""

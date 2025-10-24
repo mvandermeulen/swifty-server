@@ -1,16 +1,36 @@
-"""
-WebSocket connection manager for handling client connections and message routing.
-"""
+"""WebSocket connection manager for handling client connections and message routing."""
 from fastapi import WebSocket
-from typing import Dict, Optional, Set
+import asyncio
+import time
+from dataclasses import dataclass, field
+from typing import Dict, Optional
 from uuid import UUID
-import json
 import logging
 
 from redis_store import redis_store
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PendingDelivery:
+    """State for messages awaiting acknowledgment."""
+
+    message: dict
+    recipient_uuid: str
+    sender_uuid: str
+    attempts: int = 0
+    max_attempts: int = 5
+    next_attempt: float = field(default_factory=lambda: time.time())
+    ack_required: bool = False
+    stored_offline: bool = False
+@dataclass
+class DeliveryResult:
+    """Result of a delivery attempt."""
+
+    status: str
+    detail: str
 
 
 class ConnectionManager:
@@ -21,6 +41,14 @@ class ConnectionManager:
         self.active_connections: Dict[str, WebSocket] = {}
         # Fallback dictionary for client names (when Redis is unavailable)
         self.client_names: Dict[str, str] = {}
+        # Pending deliveries awaiting acknowledgment
+        self.pending_deliveries: Dict[str, PendingDelivery] = {}
+        self._pending_lock = asyncio.Lock()
+        self._delivery_worker_task: Optional[asyncio.Task] = None
+        self._worker_started = False
+        self._ack_timeout_seconds = 10
+        self._base_backoff_seconds = 2
+        self._max_backoff_seconds = 60
     
     async def connect(self, websocket: WebSocket, client_uuid: UUID, client_name: str):
         """
@@ -35,12 +63,18 @@ class ConnectionManager:
         client_uuid_str = str(client_uuid)
         self.active_connections[client_uuid_str] = websocket
         self.client_names[client_uuid_str] = client_name
-        
+
         # Store in Redis
         redis_store.set_client_connected(client_uuid_str, client_name)
-        
+
+        # Ensure background worker is running
+        await self._ensure_worker()
+
         logger.info(f"Client connected: {client_name} ({client_uuid_str})")
         logger.info(f"Active connections: {len(self.active_connections)}")
+
+        # Drain any queued messages for the client
+        await self._deliver_offline_messages(client_uuid_str)
     
     def disconnect(self, client_uuid: UUID):
         """
@@ -62,32 +96,51 @@ class ConnectionManager:
             logger.info(f"Client disconnected: {client_name} ({client_uuid_str})")
             logger.info(f"Active connections: {len(self.active_connections)}")
     
-    async def send_message(self, message: dict, recipient_uuid: UUID) -> bool:
+    async def send_message(self, message: dict, recipient_uuid: UUID) -> DeliveryResult:
         """
         Send a message to a specific client by UUID.
-        
+
         Args:
             message: Message dictionary
             recipient_uuid: Recipient's UUID
-            
+
         Returns:
-            True if message was sent successfully, False otherwise
+            DeliveryResult describing the delivery outcome
         """
         recipient_uuid_str = str(recipient_uuid)
-        
-        if recipient_uuid_str in self.active_connections:
-            websocket = self.active_connections[recipient_uuid_str]
-            try:
-                await websocket.send_json(message)
-                logger.info(f"Message sent to {recipient_uuid_str}")
-                return True
-            except Exception as e:
-                logger.error(f"Error sending message to {recipient_uuid_str}: {e}")
-                self.disconnect(recipient_uuid)
-                return False
-        else:
-            logger.warning(f"Recipient {recipient_uuid_str} not connected")
-            return False
+        sender_uuid = str(message.get("from") or message.get("from_", ""))
+        msgid = str(message.get("msgid"))
+        ack_required = bool(message.get("acknowledge", False))
+
+        await self._ensure_worker()
+
+        redis_store.record_delivery_attempt(msgid, {
+            "sender": sender_uuid,
+            "recipient": recipient_uuid_str,
+            "ack_required": ack_required,
+            "payload": message,
+        })
+
+        success = await self._attempt_direct_delivery(message, recipient_uuid_str)
+        now = time.time()
+
+        if success:
+            logger.info(f"Message sent to {recipient_uuid_str}")
+            status = "pending_ack" if ack_required else "delivered"
+            redis_store.update_delivery_status(msgid, status, attempts=1, last_attempt=now)
+
+            if ack_required:
+                await self._register_pending(msgid, message, recipient_uuid_str, sender_uuid)
+                return DeliveryResult("pending_ack", "Awaiting recipient acknowledgment")
+
+            return DeliveryResult("delivered", "Message delivered to recipient")
+
+        logger.warning(f"Recipient {recipient_uuid_str} not connected; queueing message")
+        queued = redis_store.enqueue_offline_message(recipient_uuid_str, message)
+        redis_store.update_delivery_status(msgid, "queued_offline", attempts=0, last_attempt=now)
+        if ack_required:
+            await self._register_pending(msgid, message, recipient_uuid_str, sender_uuid, stored_offline=queued)
+        return DeliveryResult("queued_offline", "Recipient offline - message queued for delivery")
     
     async def broadcast(self, message: dict, exclude: Optional[UUID] = None):
         """
@@ -102,14 +155,55 @@ class ConnectionManager:
         for client_uuid_str in list(self.active_connections.keys()):
             if exclude_str and client_uuid_str == exclude_str:
                 continue
-            
+
             websocket = self.active_connections[client_uuid_str]
             try:
                 await websocket.send_json(message)
             except Exception as e:
                 logger.error(f"Error broadcasting to {client_uuid_str}: {e}")
                 self.disconnect(UUID(client_uuid_str))
-    
+
+    async def handle_acknowledgment(self, msgid: str, status: str, recipient_uuid: str) -> None:
+        """Handle an acknowledgment from a recipient."""
+        status = status.lower()
+        async with self._pending_lock:
+            pending = self.pending_deliveries.get(msgid)
+
+            if not pending:
+                redis_store.update_delivery_status(msgid, status)
+                return
+
+            if pending.recipient_uuid != recipient_uuid:
+                logger.warning(
+                    "Acknowledgment recipient mismatch for %s (expected %s, got %s)",
+                    msgid,
+                    pending.recipient_uuid,
+                    recipient_uuid,
+                )
+                return
+
+            success_statuses = {"delivered", "received", "ack"}
+
+            if status in success_statuses:
+                redis_store.update_delivery_status(msgid, "delivered", ack_timestamp=time.time())
+                await self._notify_sender_update(pending.sender_uuid, msgid, "delivered")
+                del self.pending_deliveries[msgid]
+                return
+
+            pending.attempts += 1
+            if pending.attempts >= pending.max_attempts:
+                redis_store.update_delivery_status(msgid, "failed", ack_timestamp=time.time())
+                await self._notify_sender_update(pending.sender_uuid, msgid, "failed")
+                del self.pending_deliveries[msgid]
+            else:
+                pending.next_attempt = time.time() + self._compute_backoff(pending.attempts)
+                redis_store.update_delivery_status(
+                    msgid,
+                    "retrying",
+                    attempts=pending.attempts,
+                    next_attempt=pending.next_attempt,
+                )
+
     def is_client_connected(self, client_uuid: UUID) -> bool:
         """
         Check if a client is currently connected.
@@ -162,3 +256,131 @@ class ConnectionManager:
         
         logger.info(f"Broadcast to topic {topic_id}: {sent_count} recipients")
         return sent_count
+
+    async def _ensure_worker(self) -> None:
+        if self._worker_started:
+            return
+        self._worker_started = True
+        loop = asyncio.get_running_loop()
+        self._delivery_worker_task = loop.create_task(self._delivery_worker())
+
+    async def _delivery_worker(self) -> None:
+        while True:
+            await asyncio.sleep(1)
+            now = time.time()
+
+            async with self._pending_lock:
+                pending_items = list(self.pending_deliveries.items())
+
+            for msgid, pending in pending_items:
+                if pending.next_attempt > now:
+                    continue
+
+                if pending.attempts >= pending.max_attempts:
+                    redis_store.update_delivery_status(msgid, "failed", attempts=pending.attempts, last_attempt=now)
+                    await self._notify_sender_update(pending.sender_uuid, msgid, "failed")
+                    async with self._pending_lock:
+                        self.pending_deliveries.pop(msgid, None)
+                    continue
+
+                delivered = await self._attempt_direct_delivery(pending.message, pending.recipient_uuid)
+                pending.attempts += 1
+
+                if delivered:
+                    pending.next_attempt = time.time() + self._ack_timeout_seconds
+                    redis_store.update_delivery_status(msgid, "pending_ack", attempts=pending.attempts, last_attempt=time.time())
+                    pending.stored_offline = False
+                else:
+                    if not pending.stored_offline:
+                        redis_store.enqueue_offline_message(pending.recipient_uuid, pending.message)
+                        pending.stored_offline = True
+                    redis_store.update_delivery_status(
+                        msgid,
+                        "queued_offline",
+                        attempts=pending.attempts,
+                        last_attempt=time.time(),
+                    )
+                    pending.next_attempt = time.time() + self._compute_backoff(pending.attempts)
+
+    async def _attempt_direct_delivery(self, message: dict, recipient_uuid: str) -> bool:
+        if recipient_uuid in self.active_connections:
+            websocket = self.active_connections[recipient_uuid]
+            try:
+                await websocket.send_json(message)
+                return True
+            except Exception as e:
+                logger.error(f"Error sending message to {recipient_uuid}: {e}")
+                self.disconnect(UUID(recipient_uuid))
+        return False
+
+    async def _register_pending(
+        self,
+        msgid: str,
+        message: dict,
+        recipient_uuid: str,
+        sender_uuid: str,
+        stored_offline: bool = False,
+    ) -> None:
+        async with self._pending_lock:
+            pending = self.pending_deliveries.get(msgid)
+            if not pending:
+                pending = PendingDelivery(
+                    message=message,
+                    recipient_uuid=recipient_uuid,
+                    sender_uuid=sender_uuid,
+                    attempts=1 if not stored_offline else 0,
+                    max_attempts=5,
+                    next_attempt=time.time() + self._ack_timeout_seconds,
+                    ack_required=True,
+                    stored_offline=stored_offline,
+                )
+                self.pending_deliveries[msgid] = pending
+            else:
+                pending.next_attempt = time.time() + self._ack_timeout_seconds
+                if stored_offline:
+                    pending.stored_offline = True
+                else:
+                    pending.attempts = max(pending.attempts, 0) + 1
+                    pending.stored_offline = False
+
+    async def _notify_sender_update(self, sender_uuid: str, msgid: str, status: str) -> None:
+        if not sender_uuid:
+            return
+
+        message = {
+            "type": "delivery_update",
+            "msgid": msgid,
+            "status": status,
+            "timestamp": time.time(),
+        }
+
+        if sender_uuid in self.active_connections:
+            websocket = self.active_connections[sender_uuid]
+            try:
+                await websocket.send_json(message)
+            except Exception as e:
+                logger.error(f"Error notifying sender {sender_uuid}: {e}")
+
+    async def _deliver_offline_messages(self, recipient_uuid: str) -> None:
+        queued_messages = redis_store.pop_offline_messages(recipient_uuid)
+        if not queued_messages:
+            return
+
+        logger.info(f"Delivering {len(queued_messages)} offline messages to {recipient_uuid}")
+        for message in queued_messages:
+            msgid = str(message.get("msgid"))
+            sender_uuid = str(message.get("from") or message.get("from_", ""))
+            delivered = await self._attempt_direct_delivery(message, recipient_uuid)
+            now = time.time()
+            if delivered:
+                redis_store.update_delivery_status(msgid, "pending_ack" if message.get("acknowledge") else "delivered", last_attempt=now)
+                if message.get("acknowledge"):
+                    await self._register_pending(msgid, message, recipient_uuid, sender_uuid)
+                else:
+                    await self._notify_sender_update(sender_uuid, msgid, "delivered")
+            else:
+                redis_store.enqueue_offline_message(recipient_uuid, message)
+
+    def _compute_backoff(self, attempts: int) -> float:
+        delay = self._base_backoff_seconds * (2 ** max(attempts - 1, 0))
+        return min(delay, self._max_backoff_seconds)
