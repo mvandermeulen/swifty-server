@@ -88,16 +88,18 @@ curl -X POST http://localhost:8000/register \
   -d '{"name": "MyClient", "uuid": "123e4567-e89b-12d3-a456-426614174000"}'
 ```
 
-Response includes a JWT token to use for WebSocket connection.
+Response includes short-lived access and long-lived refresh tokens.
 
 ### Create a Topic/Room
 
 ```bash
-TOKEN="your-jwt-token-here"
-curl -X POST "http://localhost:8000/topics/create?token=$TOKEN" \
+ACCESS_TOKEN="your-access-token-here"
+curl -X POST "http://localhost:8000/topics/create?token=$ACCESS_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"topic_id": "my-room", "metadata": {"description": "My room"}}'
 ```
+
+Only access tokens with the `admin` role can create topics.
 
 ### List Topics
 
@@ -108,17 +110,28 @@ curl http://localhost:8000/topics
 ### Subscribe to Topic
 
 ```bash
-TOKEN="your-jwt-token-here"
-curl -X POST "http://localhost:8000/topics/subscribe?token=$TOKEN" \
+ACCESS_TOKEN="your-access-token-here"
+curl -X POST "http://localhost:8000/topics/subscribe?token=$ACCESS_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"topic_id": "my-room"}'
 ```
 
+### Refresh Tokens
+
+```bash
+REFRESH_TOKEN="your-refresh-token-here"
+curl -X POST http://localhost:8000/auth/refresh \
+  -H "Content-Type: application/json" \
+  -d '{"refresh_token": "'$REFRESH_TOKEN'"}'
+```
+
+Rotating refresh tokens also revokes the previous refresh token when rotation is enabled.
+
 ### Connect to WebSocket
 
-Use the token from registration:
+Use the access token from registration:
 ```
-ws://localhost:8000/ws?token=<your-jwt-token>
+ws://localhost:8000/ws?token=<your-access-token>
 ```
 
 ### Send a Direct Message
@@ -185,9 +198,9 @@ If port 8000 is already in use, modify `main.py`:
 uvicorn.run(app, host="0.0.0.0", port=8001)  # Change port
 ```
 
-### JWT Token Expired
+### Access Token Expired
 
-Tokens expire after 60 minutes. Re-register to get a new token.
+Access tokens expire quickly (15 minutes by default). Use the `/auth/refresh` endpoint with your refresh token to obtain a new access token.
 
 ### Recipient Not Connected
 
@@ -206,7 +219,13 @@ Install and start Redis to enable full functionality.
 
 Set these in a `.env` file or environment:
 
-- `JWT_SECRET_KEY` - Secret key for JWT signing (default: "your-secret-key-change-in-production")
+- `JWT_SECRET_KEY` - Secret key for JWT signing (required for consistent tokens; otherwise an ephemeral key is generated)
+- `JWT_SECRET_FILE` - Path to file containing the JWT secret key (optional)
+- `ACCESS_TOKEN_EXPIRE_MINUTES` - Access token lifetime in minutes (default: 15)
+- `REFRESH_TOKEN_EXPIRE_MINUTES` - Refresh token lifetime in minutes (default: 1440)
+- `TOKEN_ROTATION_ENABLED` - Enable refresh token rotation (default: true)
+- `DEFAULT_CLIENT_ROLES` - Comma-separated list of default client roles (default: `user`)
+- `ADMIN_CLIENT_IDS` - Comma-separated or JSON list of UUIDs that should receive the `admin` role
 - `REDIS_HOST` - Redis host (default: "localhost")
 - `REDIS_PORT` - Redis port (default: 6379)
 - `REDIS_DB` - Redis database number (default: 0)
