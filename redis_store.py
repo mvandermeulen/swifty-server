@@ -6,13 +6,10 @@ import json
 import logging
 import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
-
-import redis
-
-from collections import defaultdict
-from uuid import UUID
+from datetime import datetime, timezone
+from typing import Any
 
 import redis
 
@@ -52,6 +49,7 @@ class TopicData:
     metadata: dict[str, Any]
 
 
+
 class InMemoryFallbackStore:
     """Simple in-memory data store that mirrors Redis operations."""
 
@@ -63,6 +61,9 @@ class InMemoryFallbackStore:
         self.topics: dict[str, TopicData] = {}
         self.topic_subscribers: dict[str, set[str]] = {}
         self.client_topics: dict[str, set[str]] = {}
+        self.token_metadata: dict[str, dict[str, Any]] = {}
+        self.client_token_index: dict[str, set[str]] = {}
+        self.revoked_tokens: set[str] = set()
 
     # Client management -------------------------------------------------
     def register_client(self, client_uuid: str, client_name: str, token: str) -> bool:
@@ -89,6 +90,63 @@ class InMemoryFallbackStore:
     def get_client_metadata(self, client_uuid: str) -> dict[str, Any] | None:
         metadata = self.client_metadata.get(client_uuid)
         return dict(metadata) if metadata is not None else None
+
+    # Token metadata ----------------------------------------------------
+    def store_token(
+        self,
+        jti: str,
+        token: str,
+        client_uuid: str,
+        token_type: str,
+        expires_at: datetime,
+    ) -> bool:
+        self.token_metadata[jti] = {
+            "token": token,
+            "client_uuid": client_uuid,
+            "type": token_type,
+            "expires_at": expires_at,
+            "revoked": False,
+        }
+        self.client_token_index.setdefault(client_uuid, set()).add(jti)
+        self.revoked_tokens.discard(jti)
+        if token:
+            self.tokens[token] = client_uuid
+        return True
+
+    def is_token_active(self, jti: str, token: str) -> bool:
+        data = self.token_metadata.get(jti)
+        if not data or data.get("token") != token:
+            return False
+        if data.get("revoked"):
+            return False
+        expires_at = data.get("expires_at")
+        if isinstance(expires_at, datetime) and expires_at <= datetime.now(timezone.utc):
+            return False
+        return True
+
+    def revoke_token(self, jti: str) -> bool:
+        data = self.token_metadata.get(jti)
+        if not data:
+            return False
+        data["revoked"] = True
+        self.revoked_tokens.add(jti)
+        client_uuid = data.get("client_uuid")
+        if client_uuid in self.client_token_index:
+            self.client_token_index[client_uuid].discard(jti)
+            if not self.client_token_index[client_uuid]:
+                self.client_token_index.pop(client_uuid)
+        return True
+
+    def revoke_client_tokens(self, client_uuid: str, token_type: str | None = None) -> int:
+        jtis = list(self.client_token_index.get(client_uuid, set()))
+        count = 0
+        for jti in jtis:
+            data = self.token_metadata.get(jti)
+            if token_type and data and data.get("type") != token_type:
+                continue
+            if self.revoke_token(jti):
+                count += 1
+        return count
 
     # Connection state --------------------------------------------------
     def set_client_connected(self, client_uuid: str, client_name: str) -> bool:
@@ -166,6 +224,7 @@ class InMemoryFallbackStore:
 
     # Cleanup -----------------------------------------------------------
     def cleanup_client(self, client_uuid: str) -> bool:
+        self.revoke_client_tokens(client_uuid)
         topics = list(self.client_topics.get(client_uuid, set()))
         for topic_id in topics:
             self.unsubscribe_from_topic(topic_id, client_uuid)
@@ -196,11 +255,31 @@ class InMemoryFallbackStore:
                 client_uuid: list(topics)
                 for client_uuid, topics in self.client_topics.items()
             },
+            "token_metadata": {
+                jti: {
+                    "token": data.get("token"),
+                    "client_uuid": data.get("client_uuid"),
+                    "type": data.get("type"),
+                    "expires_at": (
+                        data.get("expires_at").isoformat()
+                        if isinstance(data.get("expires_at"), datetime)
+                        else None
+                    ),
+                    "revoked": data.get("revoked", False),
+                }
+                for jti, data in self.token_metadata.items()
+            },
+            "client_token_index": {
+                client_uuid: list(tokens)
+                for client_uuid, tokens in self.client_token_index.items()
+            },
+            "revoked_tokens": list(self.revoked_tokens),
         }
-
 _settings = get_settings()
+TOKEN_KEY_PREFIX = f"{_settings.redis_token_prefix}:"
 TOKEN_META_PREFIX = f"{_settings.redis_token_prefix}_meta"
-CLIENT_TOKEN_SET_PREFIX = "client_tokens"
+CLIENT_TOKEN_SET_PREFIX = f"{_settings.redis_token_prefix}_by_client"
+REVOKED_SET_KEY = f"{_settings.redis_token_prefix}_revoked"
 
 
 class RedisStore:
@@ -217,6 +296,12 @@ class RedisStore:
         self.fallback = InMemoryFallbackStore()
 
         self._connect(initial=True)
+
+    @property
+    def client(self) -> redis.Redis | None:
+        """Compatibility accessor for the underlying Redis client."""
+
+        return self._client
 
     # Connection management --------------------------------------------
     def _build_client(self) -> redis.Redis:
@@ -317,6 +402,40 @@ class RedisStore:
         for token, client_uuid in snapshot["tokens"].items():
             pipe.setex(f"token:{token}", 3600, client_uuid)
 
+        now = datetime.now(timezone.utc)
+        for jti, metadata in snapshot.get("token_metadata", {}).items():
+            token_value = metadata.get("token") or ""
+            expires_at_str = metadata.get("expires_at")
+            ttl = 3600
+            if expires_at_str:
+                try:
+                    expires_at = datetime.fromisoformat(expires_at_str)
+                    ttl = max(int((expires_at - now).total_seconds()), 1)
+                except ValueError:
+                    ttl = 3600
+            token_key = f"{TOKEN_KEY_PREFIX}{jti}"
+            meta_key = f"{TOKEN_META_PREFIX}:{jti}"
+            client_uuid = metadata.get("client_uuid") or ""
+            token_type = metadata.get("type") or ""
+            pipe.setex(token_key, ttl, token_value)
+            pipe.hset(meta_key, mapping={"client_uuid": client_uuid, "type": token_type})
+            pipe.expire(meta_key, ttl)
+            if client_uuid:
+                client_key = f"{CLIENT_TOKEN_SET_PREFIX}:{client_uuid}"
+                pipe.sadd(client_key, jti)
+                pipe.expire(client_key, max(ttl, 3600))
+
+        for client_uuid, jtis in snapshot.get("client_token_index", {}).items():
+            if jtis:
+                client_key = f"{CLIENT_TOKEN_SET_PREFIX}:{client_uuid}"
+                pipe.delete(client_key)
+                pipe.sadd(client_key, *jtis)
+
+        revoked_tokens = snapshot.get("revoked_tokens") or []
+        if revoked_tokens:
+            pipe.delete(REVOKED_SET_KEY)
+            pipe.sadd(REVOKED_SET_KEY, *revoked_tokens)
+
         # Metadata
         for client_uuid, metadata in snapshot["client_metadata"].items():
             pipe.set(f"client:{client_uuid}:metadata", json.dumps(metadata))
@@ -416,28 +535,127 @@ class RedisStore:
             self._backfill_needed = True
             raise RedisUnavailableError(exc.args[0], fallback_result=True) from exc
     
-    def get_client_metadata(self, client_uuid: str) -> Optional[Dict]:
-        """
-        Get client metadata.
-        
-        Args:
-            client_uuid: Client's UUID
-            
-        Returns:
-            Metadata dictionary or None
-        """
-        if not self.client:
-            metadata = self.fallback_clients.get(client_uuid, {}).get("metadata")
-            return metadata
+    def get_client_metadata(self, client_uuid: str) -> dict[str, Any] | None:
+        fallback_value = self.fallback.get_client_metadata(client_uuid)
 
         try:
             def op() -> dict[str, Any] | None:
                 data = self._client.get(f"client:{client_uuid}:metadata")
                 return json.loads(data) if data else None
 
-            return self._execute(op, description="get_client_metadata")
+            result = self._execute(op, description="get_client_metadata")
+            if result is not None:
+                self.fallback.update_client_metadata(client_uuid, result)
+            return result
         except RedisUnavailableError as exc:
             raise RedisUnavailableError(exc.args[0], fallback_result=fallback_value) from exc
+
+
+    # Token metadata ----------------------------------------------------
+    def store_token(
+        self,
+        *,
+        jti: str,
+        token: str,
+        client_uuid: str,
+        token_type: str,
+        ttl_seconds: int,
+        expires_at: datetime,
+    ) -> bool:
+        self.fallback.store_token(jti, token, client_uuid, token_type, expires_at)
+
+        try:
+            def op() -> bool:
+                pipe = self._client.pipeline()
+                token_key = f"{TOKEN_KEY_PREFIX}{jti}"
+                meta_key = f"{TOKEN_META_PREFIX}:{jti}"
+                client_key = f"{CLIENT_TOKEN_SET_PREFIX}:{client_uuid}"
+                pipe.setex(token_key, ttl_seconds, token)
+                pipe.hset(meta_key, mapping={"client_uuid": client_uuid, "type": token_type})
+                pipe.expire(meta_key, ttl_seconds)
+                pipe.sadd(client_key, jti)
+                pipe.expire(client_key, max(ttl_seconds, 3600))
+                pipe.srem(REVOKED_SET_KEY, jti)
+                pipe.execute()
+                return True
+
+            self._execute(op, description="store_token")
+            return True
+        except RedisUnavailableError as exc:
+            self._backfill_needed = True
+            raise RedisUnavailableError(exc.args[0], fallback_result=True) from exc
+
+    def is_token_active(
+        self,
+        jti: str,
+        token: str,
+    ) -> bool:
+        fallback_value = self.fallback.is_token_active(jti, token)
+        try:
+            def op() -> bool:
+                if self._client.sismember(REVOKED_SET_KEY, jti):
+                    return False
+                stored_token = self._client.get(f"{TOKEN_KEY_PREFIX}{jti}")
+                return stored_token == token if stored_token else False
+
+            return self._execute(op, description="is_token_active")
+        except RedisUnavailableError as exc:
+            raise RedisUnavailableError(exc.args[0], fallback_result=fallback_value) from exc
+
+    def revoke_token(self, jti: str) -> bool:
+        revoked = self.fallback.revoke_token(jti)
+        if not revoked:
+            return False
+
+        try:
+            def op() -> bool:
+                client_uuid = self._client.hget(f"{TOKEN_META_PREFIX}:{jti}", "client_uuid")
+                pipe = self._client.pipeline()
+                if client_uuid:
+                    pipe.srem(f"{CLIENT_TOKEN_SET_PREFIX}:{client_uuid}", jti)
+                pipe.delete(f"{TOKEN_KEY_PREFIX}{jti}")
+                pipe.delete(f"{TOKEN_META_PREFIX}:{jti}")
+                pipe.sadd(REVOKED_SET_KEY, jti)
+                pipe.execute()
+                return True
+
+            self._execute(op, description="revoke_token")
+            return True
+        except RedisUnavailableError as exc:
+            self._backfill_needed = True
+            raise RedisUnavailableError(exc.args[0], fallback_result=revoked) from exc
+
+    def revoke_client_tokens(
+        self,
+        client_uuid: str,
+        token_type: str | None = None,
+    ) -> int:
+        revoked_count = self.fallback.revoke_client_tokens(client_uuid, token_type)
+
+        try:
+            def op() -> int:
+                client_key = f"{CLIENT_TOKEN_SET_PREFIX}:{client_uuid}"
+                jtis = self._client.smembers(client_key) or set()
+                count = 0
+                for jti in list(jtis):
+                    stored_type = self._client.hget(f"{TOKEN_META_PREFIX}:{jti}", "type")
+                    if token_type and stored_type != token_type:
+                        continue
+                    pipe = self._client.pipeline()
+                    pipe.srem(client_key, jti)
+                    pipe.delete(f"{TOKEN_KEY_PREFIX}{jti}")
+                    pipe.delete(f"{TOKEN_META_PREFIX}:{jti}")
+                    pipe.sadd(REVOKED_SET_KEY, jti)
+                    pipe.execute()
+                    count += 1
+                return count
+
+            redis_count = self._execute(op, description="revoke_client_tokens")
+        except RedisUnavailableError as exc:
+            self._backfill_needed = True
+            raise RedisUnavailableError(exc.args[0], fallback_result=revoked_count) from exc
+
+        return max(revoked_count, redis_count)
 
     def set_client_connected(self, client_uuid: str, client_name: str) -> bool:
         self.fallback.set_client_connected(client_uuid, client_name)

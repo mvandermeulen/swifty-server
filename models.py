@@ -1,9 +1,10 @@
 """Data models for the WebSocket messaging server."""
 
+from __future__ import annotations
+
 from typing import Any
 
-from pydantic import BaseModel, Field, ConfigDict, model_validator
-from typing import Optional
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from uuid import UUID
 
 
@@ -85,10 +86,10 @@ class TokenRefreshRequest(BaseModel):
 class TokenRevokeRequest(BaseModel):
     """Administrative request for token revocation."""
 
-    token: Optional[str] = Field(default=None, description="Encoded token to revoke")
-    jti: Optional[str] = Field(default=None, description="Token identifier to revoke")
-    client_uuid: Optional[UUID] = Field(default=None, description="Client UUID whose tokens should be revoked")
-    token_type: Optional[str] = Field(
+    token: str | None = Field(default=None, description="Encoded token to revoke")
+    jti: str | None = Field(default=None, description="Token identifier to revoke")
+    client_uuid: UUID | None = Field(default=None, description="Client UUID whose tokens should be revoked")
+    token_type: str | None = Field(
         default=None,
         description="Token type filter when revoking tokens for a client (e.g. access or refresh)",
     )

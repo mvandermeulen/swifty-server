@@ -8,7 +8,6 @@ import secrets
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import List
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +28,7 @@ def _parse_int(value: str | None, default: int) -> int:
         return default
 
 
-def _parse_list(value: str | None, default: List[str]) -> List[str]:
+def _parse_list(value: str | None, default: list[str]) -> list[str]:
     if not value:
         return list(default)
     items = [item.strip() for item in value.split(",") if item.strip()]
@@ -46,8 +45,8 @@ class Settings:
     refresh_token_expire_minutes: int = 60 * 24
     token_rotation_enabled: bool = True
     audit_log_name: str = "auth.audit"
-    default_client_roles: List[str] = field(default_factory=lambda: ["user"])
-    admin_client_ids: List[str] = field(default_factory=list)
+    default_client_roles: list[str] = field(default_factory=lambda: ["user"])
+    admin_client_ids: list[str] = field(default_factory=list)
     redis_token_prefix: str = "token"
 
 
@@ -81,7 +80,7 @@ def load_settings() -> Settings:
     default_roles = _parse_list(os.getenv("DEFAULT_CLIENT_ROLES"), ["user"])
 
     admin_ids_env = os.getenv("ADMIN_CLIENT_IDS")
-    admin_ids: List[str]
+    admin_ids: list[str]
     if admin_ids_env and admin_ids_env.strip().startswith("["):
         try:
             parsed = json.loads(admin_ids_env)

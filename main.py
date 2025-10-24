@@ -72,7 +72,7 @@ async def root():
             "redis_health": "/health/redis",
             "delivery_status": "/messages/{msgid}/status",
             "undelivered": "/clients/{uuid}/undelivered",
-            "delivery_metrics": "/delivery/metrics"
+            "delivery_metrics": "/delivery/metrics",
             "refresh": "/auth/refresh",
             "revoke_tokens": "/admin/tokens/revoke",
         }
