@@ -1,0 +1,13 @@
+# Security Notice: Please use the latest secure versions
+# Update these packages to avoid known vulnerabilities:
+# - fastapi >= 0.110.0 (fixes ReDoS vulnerability)
+# - python-jose >= 3.4.0 (fixes algorithm confusion)
+# - python-multipart >= 0.0.18 (fixes DoS vulnerabilities)
+
+fastapi>=0.110.0
+uvicorn[standard]>=0.24.0
+websockets>=12.0
+python-jose[cryptography]>=3.4.0
+python-multipart>=0.0.18
+pydantic>=2.5.0
+python-dotenv>=1.0.0
