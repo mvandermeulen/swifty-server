@@ -2,10 +2,12 @@
 WebSocket connection manager for handling client connections and message routing.
 """
 from fastapi import WebSocket
-from typing import Dict, Optional
+from typing import Dict, Optional, Set
 from uuid import UUID
 import json
 import logging
+
+from redis_store import redis_store
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -15,9 +17,9 @@ class ConnectionManager:
     """Manages WebSocket connections for all clients."""
     
     def __init__(self):
-        # Dictionary mapping client UUID to WebSocket connection
+        # Dictionary mapping client UUID to WebSocket connection (in-memory)
         self.active_connections: Dict[str, WebSocket] = {}
-        # Dictionary mapping client UUID to client name
+        # Fallback dictionary for client names (when Redis is unavailable)
         self.client_names: Dict[str, str] = {}
     
     async def connect(self, websocket: WebSocket, client_uuid: UUID, client_name: str):
@@ -33,6 +35,10 @@ class ConnectionManager:
         client_uuid_str = str(client_uuid)
         self.active_connections[client_uuid_str] = websocket
         self.client_names[client_uuid_str] = client_name
+        
+        # Store in Redis
+        redis_store.set_client_connected(client_uuid_str, client_name)
+        
         logger.info(f"Client connected: {client_name} ({client_uuid_str})")
         logger.info(f"Active connections: {len(self.active_connections)}")
     
@@ -49,6 +55,10 @@ class ConnectionManager:
             del self.active_connections[client_uuid_str]
             if client_uuid_str in self.client_names:
                 del self.client_names[client_uuid_str]
+            
+            # Clean up Redis
+            redis_store.cleanup_client(client_uuid_str)
+            
             logger.info(f"Client disconnected: {client_name} ({client_uuid_str})")
             logger.info(f"Active connections: {len(self.active_connections)}")
     
@@ -119,4 +129,36 @@ class ConnectionManager:
         Returns:
             Dictionary mapping UUIDs to client names
         """
-        return self.client_names.copy()
+        # Try Redis first, fallback to in-memory
+        redis_clients = redis_store.get_connected_clients()
+        return redis_clients if redis_clients else self.client_names.copy()
+    
+    async def broadcast_to_topic(self, topic_id: str, message: dict, exclude: Optional[UUID] = None):
+        """
+        Broadcast a message to all subscribers of a topic.
+        
+        Args:
+            topic_id: Topic identifier
+            message: Message dictionary
+            exclude: Optional UUID to exclude from broadcast
+        """
+        # Get topic subscribers from Redis
+        subscribers = redis_store.get_topic_subscribers(topic_id)
+        exclude_str = str(exclude) if exclude else None
+        
+        sent_count = 0
+        for client_uuid_str in subscribers:
+            if exclude_str and client_uuid_str == exclude_str:
+                continue
+            
+            if client_uuid_str in self.active_connections:
+                websocket = self.active_connections[client_uuid_str]
+                try:
+                    await websocket.send_json(message)
+                    sent_count += 1
+                except Exception as e:
+                    logger.error(f"Error broadcasting to {client_uuid_str}: {e}")
+                    self.disconnect(UUID(client_uuid_str))
+        
+        logger.info(f"Broadcast to topic {topic_id}: {sent_count} recipients")
+        return sent_count
