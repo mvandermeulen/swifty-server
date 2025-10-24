@@ -32,7 +32,8 @@ class Message(BaseModel):
 class MessageAcknowledgment(BaseModel):
     """Model for message acknowledgment."""
     model_config = ConfigDict(populate_by_name=True)
-    
+
+    type: str = Field(default="ack", alias="type", description="Message type identifier")
     msgid: UUID = Field(..., description="Message ID being acknowledged")
     from_: UUID = Field(..., alias="from", description="Sender UUID")
     timestamp: float = Field(..., description="Acknowledgment timestamp")
