@@ -1,6 +1,6 @@
 # Swifty Server
 
-A FastAPI + WebSocket & JWT server providing real-time communications for helper devices. Each client registers with a name and UUID for addressable messaging.
+A FastAPI + WebSocket & JWT server providing real-time communications for helper devices. Each client registers with a name and UUID for addressable messaging. Supports direct messaging and topic-based (room) messaging with Redis persistence.
 
 ## Features
 
@@ -8,10 +8,14 @@ A FastAPI + WebSocket & JWT server providing real-time communications for helper
 - **JWT Authentication**: Secure token-based authentication
 - **WebSocket Communication**: Real-time bidirectional messaging
 - **Message Routing**: Route messages between clients using UUIDs
+- **Topic/Room Support**: Create and subscribe to topics for group messaging
+- **Redis Integration**: Persistent storage for connections, tokens, and topics
 - **Message Acknowledgment**: Support for message acknowledgment tracking
 - **Connection Management**: Track active clients and their connections
 
 ## Message Format
+
+### Direct Messages
 
 Messages between clients follow this JSON structure:
 
@@ -33,6 +37,26 @@ Messages between clients follow this JSON structure:
 }
 ```
 
+### Topic Messages
+
+Messages sent to a topic/room:
+
+```json
+{
+  "topic_id": "my-topic",
+  "from": "sender-uuid",
+  "timestamp": 1234567890.123,
+  "priority": "normal",
+  "subject": "Topic message",
+  "msgid": "message-uuid",
+  "content": "Message content",
+  "action": "topic_message",
+  "event": "",
+  "status": "sent",
+  "msgno": 1
+}
+```
+
 ## Installation
 
 1. Clone the repository:
@@ -48,10 +72,31 @@ pip install -r requirements.txt
 
 **Security Note**: The requirements.txt file specifies minimum secure versions of dependencies to avoid known vulnerabilities. Always use the latest stable versions when possible.
 
-3. (Optional) Set up environment variables:
+3. (Optional) Set up Redis:
+```bash
+# Using Docker
+docker run -d -p 6379:6379 redis:latest
+
+# Or install Redis locally
+# Ubuntu/Debian: sudo apt-get install redis-server
+# macOS: brew install redis
+```
+
+**Note**: The server will work without Redis but with limited functionality:
+- ✅ Client registration and authentication
+- ✅ Direct WebSocket messaging
+- ❌ Topic/room features (require Redis)
+- ❌ Persistent token storage
+- ❌ Connection state across restarts
+
+For full functionality including topics/rooms, Redis is required.
+
+4. (Optional) Set up environment variables:
 ```bash
 # Create .env file
 echo "JWT_SECRET_KEY=your-secret-key-here" > .env
+echo "REDIS_HOST=localhost" >> .env
+echo "REDIS_PORT=6379" >> .env
 ```
 
 ## Usage
@@ -119,12 +164,100 @@ GET /clients
 }
 ```
 
-#### 4. WebSocket Connection
+#### 4. Create Topic/Room
+```
+POST /topics/create?token={jwt-token}
+```
+
+**Request Body:**
+```json
+{
+  "topic_id": "my-room",
+  "metadata": {
+    "description": "My awesome room"
+  }
+}
+```
+
+**Response:**
+```json
+{
+  "message": "Topic created successfully",
+  "topic_id": "my-room",
+  "creator": "creator-uuid"
+}
+```
+
+#### 5. List Topics
+```
+GET /topics
+```
+
+**Response:**
+```json
+{
+  "count": 2,
+  "topics": [
+    {
+      "id": "my-room",
+      "creator": "creator-uuid",
+      "metadata": {},
+      "subscriber_count": 5
+    }
+  ]
+}
+```
+
+#### 6. Get Topic Info
+```
+GET /topics/{topic_id}
+```
+
+**Response:**
+```json
+{
+  "id": "my-room",
+  "creator": "creator-uuid",
+  "metadata": {},
+  "subscriber_count": 5,
+  "subscribers": ["uuid-1", "uuid-2"]
+}
+```
+
+#### 7. Subscribe to Topic
+```
+POST /topics/subscribe?token={jwt-token}
+```
+
+**Request Body:**
+```json
+{
+  "topic_id": "my-room"
+}
+```
+
+#### 8. Unsubscribe from Topic
+```
+POST /topics/unsubscribe?token={jwt-token}
+```
+
+**Request Body:**
+```json
+{
+  "topic_id": "my-room"
+}
+```
+
+#### 9. WebSocket Connection
 ```
 WS /ws?token={jwt-token}
 ```
 
 Connect to the WebSocket endpoint using the JWT token obtained from registration.
+
+**Sending Direct Messages:** Send a message with a `to` field containing the recipient UUID.
+
+**Sending Topic Messages:** Send a message with a `topic_id` field to broadcast to all topic subscribers.
 
 ## Example Usage
 
@@ -187,12 +320,14 @@ curl http://localhost:8000/clients
 
 1. **main.py** - FastAPI application with REST and WebSocket endpoints
 2. **models.py** - Pydantic data models for validation
-3. **auth.py** - JWT token generation and verification
+3. **auth.py** - JWT token generation and verification with Redis integration
 4. **connection_manager.py** - WebSocket connection management and message routing
-5. **example_client.py** - Example client implementation
+5. **redis_store.py** - Redis storage layer for persistence
+6. **example_client.py** - Example client implementation
 
 ### Message Flow
 
+#### Direct Messaging
 1. Client registers via `/register` and receives JWT token
 2. Client connects to WebSocket endpoint `/ws` with token
 3. Server validates token and accepts connection
@@ -200,19 +335,37 @@ curl http://localhost:8000/clients
 5. Server routes messages to recipient by UUID
 6. Both sender and recipient receive confirmations
 
+#### Topic/Room Messaging
+1. Client creates a topic via `/topics/create`
+2. Clients subscribe to topic via `/topics/subscribe`
+3. Client sends message with `topic_id` field via WebSocket
+4. Server broadcasts message to all subscribers
+5. Sender receives confirmation with subscriber count
+
 ### Security
 
 - JWT tokens for authentication
 - Token expiration (60 minutes by default)
+- Tokens stored in Redis with automatic expiration
 - Sender UUID verification (prevents impersonation)
 - WebSocket connection tied to authenticated identity
+- Topic subscription verification before message delivery
 
 ## Configuration
 
-Set environment variables or modify defaults in `auth.py`:
+Set environment variables or modify defaults in the respective modules:
 
+### JWT Configuration (`auth.py`)
 - `JWT_SECRET_KEY` - Secret key for JWT signing (default: "your-secret-key-change-in-production")
 - `ACCESS_TOKEN_EXPIRE_MINUTES` - Token expiration time (default: 60)
+
+### Redis Configuration (`redis_store.py`)
+- `REDIS_HOST` - Redis host (default: "localhost")
+- `REDIS_PORT` - Redis port (default: 6379)
+- `REDIS_DB` - Redis database number (default: 0)
+- `REDIS_PASSWORD` - Redis password (default: None)
+
+**Note**: If Redis is unavailable, the server falls back to in-memory storage for some features.
 
 ## Development
 
@@ -224,10 +377,14 @@ swifty-server/
 ├── models.py              # Data models
 ├── auth.py                # JWT authentication
 ├── connection_manager.py  # WebSocket manager
+├── redis_store.py         # Redis storage layer
 ├── example_client.py      # Example client
 ├── requirements.txt       # Dependencies
+├── test_server.py         # Unit tests
 ├── .gitignore            # Git ignore rules
-└── README.md             # Documentation
+├── README.md             # Documentation
+├── QUICKSTART.md         # Quick start guide
+└── IMPLEMENTATION.md     # Implementation details
 ```
 
 ### Adding Features
