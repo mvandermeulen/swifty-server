@@ -76,9 +76,10 @@ def test_jwt_token_creation():
     client_uuid = uuid4()
     client_name = "TestClient"
     
-    token = create_access_token(client_uuid, client_name)
-    assert isinstance(token, str)
-    assert len(token) > 0
+    token_details = create_access_token(client_uuid, client_name)
+    assert isinstance(token_details.token, str)
+    assert len(token_details.token) > 0
+    assert token_details.token_type == "access"
 
 
 def test_jwt_token_verification():
@@ -86,9 +87,9 @@ def test_jwt_token_verification():
     client_uuid = uuid4()
     client_name = "TestClient"
     
-    token = create_access_token(client_uuid, client_name)
-    payload = verify_token(token)
-    
+    token_details = create_access_token(client_uuid, client_name)
+    payload = verify_token(token_details.token)
+
     assert payload is not None
     assert payload["sub"] == str(client_uuid)
     assert payload["name"] == client_name
@@ -242,11 +243,11 @@ def test_redis_store_client_operations():
     
     client_uuid = str(uuid4())
     client_name = "TestClient"
-    token = "test-token-123"
+    token_jti = "test-token-jti"
     
     try:
         # Register client
-        success = store.register_client(client_uuid, client_name, token)
+        success = store.register_client(client_uuid, client_name, token_jti)
         assert success is True
         
         # Get client by UUID

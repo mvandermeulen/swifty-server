@@ -1,10 +1,7 @@
-"""
-Data models for the WebSocket messaging server.
-"""
-from pydantic import BaseModel, Field, ConfigDict
+"""Data models for the WebSocket messaging server."""
+from pydantic import BaseModel, Field, ConfigDict, model_validator
 from typing import Optional
 from uuid import UUID
-from datetime import datetime
 
 
 class ClientRegistration(BaseModel):
@@ -56,7 +53,7 @@ class TopicSubscribe(BaseModel):
 class TopicMessage(BaseModel):
     """Model for messages sent to a topic."""
     model_config = ConfigDict(populate_by_name=True)
-    
+
     topic_id: str = Field(..., description="Target topic ID")
     from_: UUID = Field(..., alias="from", description="Sender UUID")
     timestamp: float = Field(..., description="Message timestamp")
@@ -68,3 +65,27 @@ class TopicMessage(BaseModel):
     event: str = Field(default="", description="Event type")
     status: str = Field(default="sent", description="Message status")
     msgno: int = Field(default=1, description="Message number")
+
+
+class TokenRefreshRequest(BaseModel):
+    """Request payload for refresh token exchange."""
+
+    refresh_token: str = Field(..., description="Refresh token used to obtain new access credentials")
+
+
+class TokenRevokeRequest(BaseModel):
+    """Administrative request for token revocation."""
+
+    token: Optional[str] = Field(default=None, description="Encoded token to revoke")
+    jti: Optional[str] = Field(default=None, description="Token identifier to revoke")
+    client_uuid: Optional[UUID] = Field(default=None, description="Client UUID whose tokens should be revoked")
+    token_type: Optional[str] = Field(
+        default=None,
+        description="Token type filter when revoking tokens for a client (e.g. access or refresh)",
+    )
+
+    @model_validator(mode="after")
+    def ensure_target(self) -> "TokenRevokeRequest":
+        if not (self.token or self.jti or self.client_uuid):
+            raise ValueError("token, jti, or client_uuid must be provided")
+        return self

@@ -22,9 +22,10 @@ This implementation provides a complete FastAPI + WebSocket server with JWT auth
    - Full Pydantic validation
 
 3. **auth.py** (1.5KB)
-   - JWT token creation with expiration
-   - Token verification and payload extraction
-   - Configurable secret key and expiration time
+   - Access and refresh token creation with configurable lifetimes
+   - Token verification with Redis-backed revocation
+   - Refresh token rotation and administrative revocation helpers
+   - Config-driven secret management and role injection
 
 4. **connection_manager.py** (4.4KB)
    - WebSocket connection registry
@@ -127,8 +128,8 @@ All functionality verified:
 ## Message Flow
 
 1. Client sends POST to `/register` with name and UUID
-2. Server returns JWT token
-3. Client connects to WebSocket `/ws?token={jwt}`
+2. Server returns access and refresh tokens
+3. Client connects to WebSocket `/ws?token={access-token}`
 4. Server validates token and accepts connection
 5. Client sends message with recipient UUID
 6. Server validates sender and routes to recipient

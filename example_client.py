@@ -30,7 +30,8 @@ class SwiftyClient:
         self.server_url = server_url.rstrip('/')
         self.name = name
         self.uuid = uuid4()
-        self.token = None
+        self.access_token = None
+        self.refresh_token = None
         self.ws = None
     
     def register(self):
@@ -47,9 +48,13 @@ class SwiftyClient:
         
         if response.status_code == 200:
             data = response.json()
-            self.token = data["token"]
+            self.access_token = data.get("access_token")
+            self.refresh_token = data.get("refresh_token")
             print(f"✓ Registration successful!")
-            print(f"  Token: {self.token[:50]}...")
+            if self.access_token:
+                print(f"  Access token: {self.access_token[:50]}...")
+            if self.refresh_token:
+                print(f"  Refresh token: {self.refresh_token[:50]}...")
             return True
         else:
             print(f"✗ Registration failed: {response.text}")
@@ -57,12 +62,12 @@ class SwiftyClient:
     
     async def connect(self):
         """Connect to WebSocket endpoint."""
-        if not self.token:
+        if not self.access_token:
             print("✗ No token available. Please register first.")
             return False
-        
+
         ws_url = self.server_url.replace('http://', 'ws://').replace('https://', 'wss://')
-        uri = f"{ws_url}/ws?token={self.token}"
+        uri = f"{ws_url}/ws?token={self.access_token}"
         
         print(f"Connecting to WebSocket...")
         try:
