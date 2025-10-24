@@ -6,3 +6,4 @@ httpx>=0.26
 ruff>=0.1.13
 mypy>=1.8
 coverage>=7.3
+types-requests>=2.31

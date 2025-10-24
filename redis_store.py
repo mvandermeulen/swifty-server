@@ -7,9 +7,10 @@ import logging
 import os
 import time
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 
 import redis
 
@@ -22,6 +23,12 @@ REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 class RedisStoreError(Exception):
@@ -64,6 +71,8 @@ class InMemoryFallbackStore:
         self.token_metadata: dict[str, dict[str, Any]] = {}
         self.client_token_index: dict[str, set[str]] = {}
         self.revoked_tokens: set[str] = set()
+        self.offline_messages: dict[str, list[dict[str, Any]]] = {}
+        self.delivery_status: dict[str, dict[str, Any]] = {}
 
     # Client management -------------------------------------------------
     def register_client(self, client_uuid: str, client_name: str, token: str) -> bool:
@@ -163,6 +172,67 @@ class InMemoryFallbackStore:
     def is_client_connected(self, client_uuid: str) -> bool:
         return client_uuid in self.connected_clients
 
+    # Delivery tracking -------------------------------------------------
+    def record_delivery_attempt(self, msgid: str, metadata: dict[str, Any]) -> bool:
+        entry = self.delivery_status.setdefault(msgid, {})
+        entry.setdefault("created_at", time.time())
+        entry.setdefault("attempts", 0)
+        entry["attempts"] = int(entry.get("attempts", 0)) + 1
+        entry["status"] = "attempted"
+        entry["last_attempt"] = time.time()
+        payload = metadata.get("payload")
+        entry.update({k: v for k, v in metadata.items() if k != "payload"})
+        if isinstance(payload, dict):
+            entry["payload"] = deepcopy(payload)
+        elif payload is not None:
+            entry["payload"] = payload
+        return True
+
+    def update_delivery_status(self, msgid: str, status: str, **extra: Any) -> bool:
+        entry = self.delivery_status.setdefault(msgid, {})
+        entry.setdefault("created_at", time.time())
+        entry.setdefault("attempts", 0)
+        entry["status"] = status
+        if "last_attempt" not in extra:
+            entry.setdefault("last_attempt", time.time())
+        entry.update(extra)
+        return True
+
+    def enqueue_offline_message(self, recipient_uuid: str, message: dict[str, Any]) -> bool:
+        queue = self.offline_messages.setdefault(recipient_uuid, [])
+        queue.append(deepcopy(message))
+        return True
+
+    def pop_offline_messages(self, recipient_uuid: str) -> list[dict[str, Any]]:
+        messages = self.offline_messages.pop(recipient_uuid, [])
+        return [deepcopy(message) for message in messages]
+
+    def get_delivery_status(self, msgid: str) -> dict[str, Any] | None:
+        entry = self.delivery_status.get(msgid)
+        return deepcopy(entry) if entry is not None else None
+
+    def list_undelivered_messages(self, client_uuid: str) -> list[dict[str, Any]]:
+        messages = self.offline_messages.get(client_uuid, [])
+        return [deepcopy(message) for message in messages]
+
+    def get_delivery_metrics(self) -> dict[str, Any]:
+        status_counts: dict[str, int] = {}
+        for data in self.delivery_status.values():
+            status = str(data.get("status", "unknown"))
+            status_counts[status] = status_counts.get(status, 0) + 1
+
+        offline_sizes = {
+            client_uuid: len(messages)
+            for client_uuid, messages in self.offline_messages.items()
+        }
+
+        return {
+            "tracked_messages": len(self.delivery_status),
+            "status_counts": status_counts,
+            "offline_queue_sizes": offline_sizes,
+            "total_offline": sum(offline_sizes.values()),
+        }
+
     # Topic management --------------------------------------------------
     def create_topic(
         self, topic_id: str, creator_uuid: str, metadata: dict[str, Any] | None = None
@@ -230,6 +300,7 @@ class InMemoryFallbackStore:
             self.unsubscribe_from_topic(topic_id, client_uuid)
         self.set_client_disconnected(client_uuid)
         self.client_metadata.pop(client_uuid, None)
+        self.offline_messages.pop(client_uuid, None)
         return True
 
     # Snapshot ----------------------------------------------------------
@@ -261,8 +332,8 @@ class InMemoryFallbackStore:
                     "client_uuid": data.get("client_uuid"),
                     "type": data.get("type"),
                     "expires_at": (
-                        data.get("expires_at").isoformat()
-                        if isinstance(data.get("expires_at"), datetime)
+                        expires_at.isoformat()
+                        if isinstance((expires_at := data.get("expires_at")), datetime)
                         else None
                     ),
                     "revoked": data.get("revoked", False),
@@ -274,12 +345,23 @@ class InMemoryFallbackStore:
                 for client_uuid, tokens in self.client_token_index.items()
             },
             "revoked_tokens": list(self.revoked_tokens),
+            "offline_messages": {
+                client_uuid: [deepcopy(message) for message in messages]
+                for client_uuid, messages in self.offline_messages.items()
+            },
+            "delivery_status": {
+                msgid: deepcopy(data) for msgid, data in self.delivery_status.items()
+            },
         }
 _settings = get_settings()
 TOKEN_KEY_PREFIX = f"{_settings.redis_token_prefix}:"
 TOKEN_META_PREFIX = f"{_settings.redis_token_prefix}_meta"
 CLIENT_TOKEN_SET_PREFIX = f"{_settings.redis_token_prefix}_by_client"
 REVOKED_SET_KEY = f"{_settings.redis_token_prefix}_revoked"
+DELIVERY_STATUS_PREFIX = "delivery:status"
+DELIVERY_STATUS_INDEX_KEY = "delivery:ids"
+OFFLINE_QUEUE_PREFIX = "offline:queue"
+OFFLINE_QUEUE_INDEX_KEY = "offline:recipients"
 
 
 class RedisStore:
@@ -387,12 +469,19 @@ class RedisStore:
             f"Redis unavailable during {description}; using fallback store instead."
         ) from last_error
 
+    def _require_client(self) -> redis.Redis:
+        client = self._client
+        if client is None:
+            raise RedisUnavailableError("Redis client unavailable")
+        return client
+
     def _backfill_from_fallback(self) -> None:
-        if not self._client or not self._backfill_needed:
+        client = self._client
+        if client is None or not self._backfill_needed:
             return
 
         snapshot = self.fallback.snapshot()
-        pipe = self._client.pipeline()
+        pipe = client.pipeline()
 
         # Clients
         for client_uuid, client_data in snapshot["clients"].items():
@@ -467,6 +556,22 @@ class RedisStore:
                 pipe.delete(f"client:{client_uuid}:topics")
                 pipe.sadd(f"client:{client_uuid}:topics", *topics)
 
+        for recipient_uuid, messages in snapshot.get("offline_messages", {}).items():
+            queue_key = f"{OFFLINE_QUEUE_PREFIX}:{recipient_uuid}"
+            pipe.delete(queue_key)
+            if messages:
+                pipe.rpush(queue_key, *[json.dumps(message) for message in messages])
+                pipe.sadd(OFFLINE_QUEUE_INDEX_KEY, recipient_uuid)
+            else:
+                pipe.srem(OFFLINE_QUEUE_INDEX_KEY, recipient_uuid)
+
+        delivery_snapshot = snapshot.get("delivery_status", {})
+        if delivery_snapshot:
+            pipe.delete(DELIVERY_STATUS_INDEX_KEY)
+            pipe.sadd(DELIVERY_STATUS_INDEX_KEY, *delivery_snapshot.keys())
+        for msgid, data in delivery_snapshot.items():
+            pipe.set(f"{DELIVERY_STATUS_PREFIX}:{msgid}", json.dumps(data))
+
         pipe.execute()
         self._backfill_needed = False
         logger.info("Redis backfilled from fallback store")
@@ -477,7 +582,8 @@ class RedisStore:
 
         try:
             def op() -> bool:
-                pipe = self._client.pipeline()
+                client = self._require_client()
+                pipe = client.pipeline()
                 pipe.hset(
                     f"client:{client_uuid}",
                     mapping={"uuid": client_uuid, "name": client_name, "token": token},
@@ -496,10 +602,14 @@ class RedisStore:
         fallback_value = self.fallback.get_client_by_uuid(client_uuid)
         try:
             def op() -> dict[str, Any] | None:
-                data = self._client.hgetall(f"client:{client_uuid}")
+                client = self._require_client()
+                data = cast(dict[str, Any], client.hgetall(f"client:{client_uuid}"))
                 return data or None
 
-            result = self._execute(op, description="get_client_by_uuid")
+            result = cast(
+                dict[str, Any] | None,
+                self._execute(op, description="get_client_by_uuid"),
+            )
             if result:
                 token = result.get("token", "")
                 self.fallback.register_client(client_uuid, result.get("name", ""), token)
@@ -511,9 +621,13 @@ class RedisStore:
         fallback_value = self.fallback.get_client_by_token(token)
         try:
             def op() -> str | None:
-                return self._client.get(f"token:{token}")
+                client = self._require_client()
+                return cast(str | None, client.get(f"token:{token}"))
 
-            result = self._execute(op, description="get_client_by_token")
+            result = cast(
+                str | None,
+                self._execute(op, description="get_client_by_token"),
+            )
             if result:
                 client = self.get_client_by_uuid(result)
                 if client:
@@ -526,7 +640,8 @@ class RedisStore:
         self.fallback.update_client_metadata(client_uuid, metadata)
         try:
             def op() -> bool:
-                self._client.set(f"client:{client_uuid}:metadata", json.dumps(metadata))
+                client = self._require_client()
+                client.set(f"client:{client_uuid}:metadata", json.dumps(metadata))
                 return True
 
             self._execute(op, description="update_client_metadata")
@@ -540,10 +655,14 @@ class RedisStore:
 
         try:
             def op() -> dict[str, Any] | None:
-                data = self._client.get(f"client:{client_uuid}:metadata")
+                client = self._require_client()
+                data = cast(str | None, client.get(f"client:{client_uuid}:metadata"))
                 return json.loads(data) if data else None
 
-            result = self._execute(op, description="get_client_metadata")
+            result = cast(
+                dict[str, Any] | None,
+                self._execute(op, description="get_client_metadata"),
+            )
             if result is not None:
                 self.fallback.update_client_metadata(client_uuid, result)
             return result
@@ -566,7 +685,8 @@ class RedisStore:
 
         try:
             def op() -> bool:
-                pipe = self._client.pipeline()
+                client = self._require_client()
+                pipe = client.pipeline()
                 token_key = f"{TOKEN_KEY_PREFIX}{jti}"
                 meta_key = f"{TOKEN_META_PREFIX}:{jti}"
                 client_key = f"{CLIENT_TOKEN_SET_PREFIX}:{client_uuid}"
@@ -593,12 +713,13 @@ class RedisStore:
         fallback_value = self.fallback.is_token_active(jti, token)
         try:
             def op() -> bool:
-                if self._client.sismember(REVOKED_SET_KEY, jti):
+                client = self._require_client()
+                if client.sismember(REVOKED_SET_KEY, jti):
                     return False
-                stored_token = self._client.get(f"{TOKEN_KEY_PREFIX}{jti}")
+                stored_token = cast(str | None, client.get(f"{TOKEN_KEY_PREFIX}{jti}"))
                 return stored_token == token if stored_token else False
 
-            return self._execute(op, description="is_token_active")
+            return cast(bool, self._execute(op, description="is_token_active"))
         except RedisUnavailableError as exc:
             raise RedisUnavailableError(exc.args[0], fallback_result=fallback_value) from exc
 
@@ -609,8 +730,9 @@ class RedisStore:
 
         try:
             def op() -> bool:
-                client_uuid = self._client.hget(f"{TOKEN_META_PREFIX}:{jti}", "client_uuid")
-                pipe = self._client.pipeline()
+                client = self._require_client()
+                client_uuid = client.hget(f"{TOKEN_META_PREFIX}:{jti}", "client_uuid")
+                pipe = client.pipeline()
                 if client_uuid:
                     pipe.srem(f"{CLIENT_TOKEN_SET_PREFIX}:{client_uuid}", jti)
                 pipe.delete(f"{TOKEN_KEY_PREFIX}{jti}")
@@ -635,13 +757,14 @@ class RedisStore:
         try:
             def op() -> int:
                 client_key = f"{CLIENT_TOKEN_SET_PREFIX}:{client_uuid}"
-                jtis = self._client.smembers(client_key) or set()
+                client = self._require_client()
+                jtis = cast(set[str], client.smembers(client_key) or set())
                 count = 0
                 for jti in list(jtis):
-                    stored_type = self._client.hget(f"{TOKEN_META_PREFIX}:{jti}", "type")
+                    stored_type = client.hget(f"{TOKEN_META_PREFIX}:{jti}", "type")
                     if token_type and stored_type != token_type:
                         continue
-                    pipe = self._client.pipeline()
+                    pipe = client.pipeline()
                     pipe.srem(client_key, jti)
                     pipe.delete(f"{TOKEN_KEY_PREFIX}{jti}")
                     pipe.delete(f"{TOKEN_META_PREFIX}:{jti}")
@@ -650,7 +773,7 @@ class RedisStore:
                     count += 1
                 return count
 
-            redis_count = self._execute(op, description="revoke_client_tokens")
+            redis_count = cast(int, self._execute(op, description="revoke_client_tokens"))
         except RedisUnavailableError as exc:
             self._backfill_needed = True
             raise RedisUnavailableError(exc.args[0], fallback_result=revoked_count) from exc
@@ -661,7 +784,8 @@ class RedisStore:
         self.fallback.set_client_connected(client_uuid, client_name)
         try:
             def op() -> bool:
-                self._client.hset("connected_clients", client_uuid, client_name)
+                client = self._require_client()
+                client.hset("connected_clients", client_uuid, client_name)
                 return True
 
             self._execute(op, description="set_client_connected")
@@ -674,7 +798,8 @@ class RedisStore:
         self.fallback.set_client_disconnected(client_uuid)
         try:
             def op() -> bool:
-                self._client.hdel("connected_clients", client_uuid)
+                client = self._require_client()
+                client.hdel("connected_clients", client_uuid)
                 return True
 
             self._execute(op, description="set_client_disconnected")
@@ -687,9 +812,13 @@ class RedisStore:
         fallback_value = self.fallback.get_connected_clients()
         try:
             def op() -> dict[str, str]:
-                return self._client.hgetall("connected_clients")
+                client = self._require_client()
+                return cast(dict[str, str], client.hgetall("connected_clients"))
 
-            return self._execute(op, description="get_connected_clients")
+            return cast(
+                dict[str, str],
+                self._execute(op, description="get_connected_clients"),
+            )
         except RedisUnavailableError as exc:
             raise RedisUnavailableError(exc.args[0], fallback_result=fallback_value) from exc
 
@@ -697,9 +826,159 @@ class RedisStore:
         fallback_value = self.fallback.is_client_connected(client_uuid)
         try:
             def op() -> bool:
-                return bool(self._client.hexists("connected_clients", client_uuid))
+                client = self._require_client()
+                return bool(client.hexists("connected_clients", client_uuid))
 
             return bool(self._execute(op, description="is_client_connected"))
+        except RedisUnavailableError as exc:
+            raise RedisUnavailableError(exc.args[0], fallback_result=fallback_value) from exc
+
+    def record_delivery_attempt(self, msgid: str, metadata: dict[str, Any]) -> bool:
+        self.fallback.record_delivery_attempt(msgid, metadata)
+        entry = self.fallback.get_delivery_status(msgid) or {}
+
+        try:
+            def op() -> bool:
+                client = self._require_client()
+                payload = json.dumps(entry, default=_json_default)
+                pipe = client.pipeline()
+                pipe.set(f"{DELIVERY_STATUS_PREFIX}:{msgid}", payload)
+                pipe.sadd(DELIVERY_STATUS_INDEX_KEY, msgid)
+                pipe.execute()
+                return True
+
+            self._execute(op, description="record_delivery_attempt")
+            return True
+        except RedisUnavailableError as exc:
+            self._backfill_needed = True
+            raise RedisUnavailableError(exc.args[0], fallback_result=True) from exc
+
+    def update_delivery_status(self, msgid: str, status: str, **extra: Any) -> bool:
+        self.fallback.update_delivery_status(msgid, status, **extra)
+        entry = self.fallback.get_delivery_status(msgid) or {"status": status}
+
+        try:
+            def op() -> bool:
+                client = self._require_client()
+                payload = json.dumps(entry, default=_json_default)
+                pipe = client.pipeline()
+                pipe.set(f"{DELIVERY_STATUS_PREFIX}:{msgid}", payload)
+                pipe.sadd(DELIVERY_STATUS_INDEX_KEY, msgid)
+                pipe.execute()
+                return True
+
+            self._execute(op, description="update_delivery_status")
+            return True
+        except RedisUnavailableError as exc:
+            self._backfill_needed = True
+            raise RedisUnavailableError(exc.args[0], fallback_result=True) from exc
+
+    def enqueue_offline_message(self, recipient_uuid: str, message: dict[str, Any]) -> bool:
+        queued = self.fallback.enqueue_offline_message(recipient_uuid, message)
+        try:
+            def op() -> bool:
+                client = self._require_client()
+                payload = json.dumps(message, default=_json_default)
+                pipe = client.pipeline()
+                pipe.rpush(f"{OFFLINE_QUEUE_PREFIX}:{recipient_uuid}", payload)
+                pipe.sadd(OFFLINE_QUEUE_INDEX_KEY, recipient_uuid)
+                pipe.execute()
+                return True
+
+            self._execute(op, description="enqueue_offline_message")
+            return queued
+        except RedisUnavailableError as exc:
+            self._backfill_needed = True
+            raise RedisUnavailableError(exc.args[0], fallback_result=queued) from exc
+
+    def pop_offline_messages(self, recipient_uuid: str) -> list[dict[str, Any]]:
+        messages = self.fallback.pop_offline_messages(recipient_uuid)
+        try:
+            def op() -> list[dict[str, Any]]:
+                client = self._require_client()
+                queue_key = f"{OFFLINE_QUEUE_PREFIX}:{recipient_uuid}"
+                raw_messages = cast(list[str], client.lrange(queue_key, 0, -1))
+                pipe = client.pipeline()
+                pipe.delete(queue_key)
+                pipe.srem(OFFLINE_QUEUE_INDEX_KEY, recipient_uuid)
+                pipe.execute()
+                return [json.loads(item) for item in raw_messages]
+
+            redis_messages = cast(
+                list[dict[str, Any]],
+                self._execute(op, description="pop_offline_messages"),
+            )
+            return redis_messages or messages
+        except RedisUnavailableError as exc:
+            self._backfill_needed = True
+            raise RedisUnavailableError(exc.args[0], fallback_result=messages) from exc
+
+    def get_delivery_status(self, msgid: str) -> dict[str, Any] | None:
+        fallback_value = self.fallback.get_delivery_status(msgid)
+        try:
+            def op() -> dict[str, Any] | None:
+                client = self._require_client()
+                raw = cast(str | None, client.get(f"{DELIVERY_STATUS_PREFIX}:{msgid}"))
+                return json.loads(raw) if raw else None
+
+            result = cast(
+                dict[str, Any] | None,
+                self._execute(op, description="get_delivery_status"),
+            )
+            if result is not None:
+                self.fallback.delivery_status[msgid] = deepcopy(result)
+            return result
+        except RedisUnavailableError as exc:
+            raise RedisUnavailableError(exc.args[0], fallback_result=fallback_value) from exc
+
+    def list_undelivered_messages(self, client_uuid: str) -> list[dict[str, Any]]:
+        fallback_value = self.fallback.list_undelivered_messages(client_uuid)
+        try:
+            def op() -> list[dict[str, Any]]:
+                client = self._require_client()
+                queue_key = f"{OFFLINE_QUEUE_PREFIX}:{client_uuid}"
+                raw_messages = cast(list[str], client.lrange(queue_key, 0, -1))
+                return [json.loads(item) for item in raw_messages]
+
+            return cast(
+                list[dict[str, Any]],
+                self._execute(op, description="list_undelivered_messages"),
+            )
+        except RedisUnavailableError as exc:
+            raise RedisUnavailableError(exc.args[0], fallback_result=fallback_value) from exc
+
+    def get_delivery_metrics(self) -> dict[str, Any]:
+        fallback_value = self.fallback.get_delivery_metrics()
+        try:
+            def op() -> dict[str, Any]:
+                client = self._require_client()
+                status_ids = cast(set[str], client.smembers(DELIVERY_STATUS_INDEX_KEY) or set())
+                status_counts: dict[str, int] = {}
+                for msgid in status_ids:
+                    raw = cast(str | None, client.get(f"{DELIVERY_STATUS_PREFIX}:{msgid}"))
+                    if not raw:
+                        continue
+                    data = json.loads(raw)
+                    status = str(data.get("status", "unknown"))
+                    status_counts[status] = status_counts.get(status, 0) + 1
+
+                offline_queue_sizes: dict[str, int] = {}
+                recipients = cast(set[str], client.smembers(OFFLINE_QUEUE_INDEX_KEY) or set())
+                for recipient in recipients:
+                    length = cast(int, client.llen(f"{OFFLINE_QUEUE_PREFIX}:{recipient}"))
+                    offline_queue_sizes[str(recipient)] = int(length)
+
+                return {
+                    "tracked_messages": len(status_ids),
+                    "status_counts": status_counts,
+                    "offline_queue_sizes": offline_queue_sizes,
+                    "total_offline": sum(offline_queue_sizes.values()),
+                }
+
+            return cast(
+                dict[str, Any],
+                self._execute(op, description="get_delivery_metrics"),
+            )
         except RedisUnavailableError as exc:
             raise RedisUnavailableError(exc.args[0], fallback_result=fallback_value) from exc
 
@@ -712,7 +991,8 @@ class RedisStore:
         try:
             def op() -> bool:
                 topic_key = f"topic:{topic_id}"
-                pipe = self._client.pipeline()
+                client = self._require_client()
+                pipe = client.pipeline()
                 pipe.hset(
                     topic_key,
                     mapping={
@@ -735,13 +1015,14 @@ class RedisStore:
         fallback_value = self.fallback.get_topic(topic_id)
         try:
             def op() -> dict[str, Any] | None:
+                client = self._require_client()
                 topic_key = f"topic:{topic_id}"
-                data = self._client.hgetall(topic_key)
+                data = cast(dict[str, Any], client.hgetall(topic_key))
                 if data and "metadata" in data:
                     data["metadata"] = json.loads(data["metadata"])
                 return data or None
 
-            return self._execute(op, description="get_topic")
+            return cast(dict[str, Any] | None, self._execute(op, description="get_topic"))
         except RedisUnavailableError as exc:
             raise RedisUnavailableError(exc.args[0], fallback_result=fallback_value) from exc
 
@@ -749,10 +1030,11 @@ class RedisStore:
         fallback_value = self.fallback.list_topics()
         try:
             def op() -> list[str]:
-                topics = self._client.smembers("topics")
+                client = self._require_client()
+                topics = cast(set[str], client.smembers("topics"))
                 return list(topics) if topics else []
 
-            return self._execute(op, description="list_topics")
+            return cast(list[str], self._execute(op, description="list_topics"))
         except RedisUnavailableError as exc:
             raise RedisUnavailableError(exc.args[0], fallback_result=fallback_value) from exc
 
@@ -762,7 +1044,8 @@ class RedisStore:
             return False
         try:
             def op() -> bool:
-                pipe = self._client.pipeline()
+                client = self._require_client()
+                pipe = client.pipeline()
                 pipe.delete(f"topic:{topic_id}")
                 pipe.delete(f"topic:{topic_id}:subscribers")
                 pipe.srem("topics", topic_id)
@@ -780,7 +1063,8 @@ class RedisStore:
             return False
         try:
             def op() -> bool:
-                pipe = self._client.pipeline()
+                client = self._require_client()
+                pipe = client.pipeline()
                 pipe.sadd(f"topic:{topic_id}:subscribers", client_uuid)
                 pipe.sadd(f"client:{client_uuid}:topics", topic_id)
                 pipe.execute()
@@ -795,7 +1079,8 @@ class RedisStore:
         unsubscribed = self.fallback.unsubscribe_from_topic(topic_id, client_uuid)
         try:
             def op() -> bool:
-                pipe = self._client.pipeline()
+                client = self._require_client()
+                pipe = client.pipeline()
                 pipe.srem(f"topic:{topic_id}:subscribers", client_uuid)
                 pipe.srem(f"client:{client_uuid}:topics", topic_id)
                 pipe.execute()
@@ -810,10 +1095,11 @@ class RedisStore:
         fallback_value = self.fallback.get_topic_subscribers(topic_id)
         try:
             def op() -> set[str]:
-                subscribers = self._client.smembers(f"topic:{topic_id}:subscribers")
+                client = self._require_client()
+                subscribers = cast(set[str], client.smembers(f"topic:{topic_id}:subscribers"))
                 return set(subscribers) if subscribers else set()
 
-            return self._execute(op, description="get_topic_subscribers")
+            return cast(set[str], self._execute(op, description="get_topic_subscribers"))
         except RedisUnavailableError as exc:
             raise RedisUnavailableError(exc.args[0], fallback_result=fallback_value) from exc
 
@@ -821,10 +1107,11 @@ class RedisStore:
         fallback_value = self.fallback.get_client_topics(client_uuid)
         try:
             def op() -> set[str]:
-                topics = self._client.smembers(f"client:{client_uuid}:topics")
+                client = self._require_client()
+                topics = cast(set[str], client.smembers(f"client:{client_uuid}:topics"))
                 return set(topics) if topics else set()
 
-            return self._execute(op, description="get_client_topics")
+            return cast(set[str], self._execute(op, description="get_client_topics"))
         except RedisUnavailableError as exc:
             raise RedisUnavailableError(exc.args[0], fallback_result=fallback_value) from exc
 
@@ -833,7 +1120,8 @@ class RedisStore:
         self.fallback.cleanup_client(client_uuid)
         try:
             def op() -> bool:
-                pipe = self._client.pipeline()
+                client = self._require_client()
+                pipe = client.pipeline()
                 for topic_id in topics_for_cleanup:
                     pipe.srem(f"topic:{topic_id}:subscribers", client_uuid)
                 pipe.hdel("connected_clients", client_uuid)
