@@ -1,0 +1,282 @@
+asyncapi: '2.6.0'
+info:
+  title: Swifty Server WebSocket API
+  version: 1.1.0
+  description: |
+    Streaming contract for the `/ws` endpoint exposed by Swifty Server.
+
+    Clients authenticate using a JWT token obtained from the REST `/register`
+    endpoint (see OpenAPI document). Tokens are supplied through the `token`
+    query parameter during the WebSocket handshake.
+  x-compatibility:
+    default-versioning: semver
+    deprecation-policy: |
+      Event shapes remain backward compatible for a full major version. New
+      optional fields may be appended without notice. Breaking changes are
+      communicated at least two releases in advance via the `status.updated`
+      broadcast and the public changelog.
+servers:
+  production:
+    url: wss://ws.swifty.example.com/ws
+    protocol: wss
+    protocolVersion: '13'
+    description: Primary WebSocket entrypoint
+    security:
+      - jwtQuery: []
+  staging:
+    url: wss://staging.ws.swifty.example.com/ws
+    protocol: wss
+    protocolVersion: '13'
+channels:
+  ws:
+    description: Bidirectional messaging channel for direct and topic events.
+    parameters:
+      token:
+        description: JWT returned by the `/register` REST endpoint.
+        schema:
+          type: string
+    publish:
+      summary: Frames the client may send to the server.
+      operationId: clientToServer
+      message:
+        oneOf:
+          - $ref: '#/components/messages/DirectMessage'
+          - $ref: '#/components/messages/TopicPublish'
+          - $ref: '#/components/messages/AckFrame'
+    subscribe:
+      summary: Frames the server may push to the client.
+      operationId: serverToClient
+      message:
+        oneOf:
+          - $ref: '#/components/messages/ConnectionReady'
+          - $ref: '#/components/messages/DirectSent'
+          - $ref: '#/components/messages/TopicSent'
+          - $ref: '#/components/messages/InboundDirect'
+          - $ref: '#/components/messages/InboundTopic'
+          - $ref: '#/components/messages/ErrorFrame'
+          - $ref: '#/components/messages/StatusUpdate'
+components:
+  securitySchemes:
+    jwtQuery:
+      type: apiKey
+      in: query
+      name: token
+      description: JWT created by the `/register` endpoint.
+  schemas:
+    UUID:
+      type: string
+      format: uuid
+    Timestamp:
+      type: number
+      format: double
+      description: Epoch timestamp in seconds.
+    DirectPayload:
+      type: object
+      required:
+        - to
+        - from
+        - timestamp
+        - priority
+        - subject
+        - msgid
+        - acknowledge
+        - content
+        - action
+        - event
+        - status
+        - conversation_id
+        - msgno
+      properties:
+        to:
+          $ref: '#/components/schemas/UUID'
+        from:
+          $ref: '#/components/schemas/UUID'
+        timestamp:
+          $ref: '#/components/schemas/Timestamp'
+        priority:
+          type: string
+        subject:
+          type: string
+        msgid:
+          $ref: '#/components/schemas/UUID'
+        acknowledge:
+          type: boolean
+        content:
+          type: string
+        action:
+          type: string
+        event:
+          type: string
+        status:
+          type: string
+        conversation_id:
+          type: string
+        msgno:
+          type: integer
+    TopicPayload:
+      allOf:
+        - $ref: '#/components/schemas/DirectPayload'
+        - type: object
+          required:
+            - topic_id
+          properties:
+            topic_id:
+              type: string
+    AckPayload:
+      type: object
+      required:
+        - type
+        - msgid
+        - from
+        - timestamp
+        - status
+      properties:
+        type:
+          type: string
+          enum: [ack]
+        msgid:
+          $ref: '#/components/schemas/UUID'
+        from:
+          $ref: '#/components/schemas/UUID'
+        timestamp:
+          $ref: '#/components/schemas/Timestamp'
+        status:
+          type: string
+          description: Application-specific acknowledgment state.
+    ConnectionNotice:
+      type: object
+      required:
+        - type
+        - message
+        - uuid
+        - name
+        - timestamp
+      properties:
+        type:
+          type: string
+          enum: [connection]
+        message:
+          type: string
+        uuid:
+          $ref: '#/components/schemas/UUID'
+        name:
+          type: string
+        timestamp:
+          $ref: '#/components/schemas/Timestamp'
+    DeliveryReceipt:
+      type: object
+      required:
+        - type
+        - message
+        - msgid
+        - timestamp
+      properties:
+        type:
+          type: string
+          enum: [sent, topic_sent]
+        message:
+          type: string
+        msgid:
+          $ref: '#/components/schemas/UUID'
+        timestamp:
+          $ref: '#/components/schemas/Timestamp'
+        topic_id:
+          type: string
+          description: Only present for topic_sent frames.
+    ErrorPayload:
+      type: object
+      required:
+        - type
+        - message
+        - timestamp
+      properties:
+        type:
+          type: string
+          enum: [error]
+        message:
+          type: string
+        timestamp:
+          $ref: '#/components/schemas/Timestamp'
+        detail:
+          type: object
+          additionalProperties: true
+        msgid:
+          $ref: '#/components/schemas/UUID'
+          description: Echoed when the error relates to a specific message.
+    StatusPayload:
+      type: object
+      required:
+        - type
+        - message
+        - timestamp
+      properties:
+        type:
+          type: string
+          enum: [status.updated]
+        message:
+          type: string
+        timestamp:
+          $ref: '#/components/schemas/Timestamp'
+        version:
+          type: string
+        affected:
+          type: array
+          items:
+            type: string
+          description: List of fields or messages impacted by the update.
+  messages:
+    DirectMessage:
+      name: direct.message
+      title: Direct message
+      summary: Routed to a single recipient by UUID.
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/DirectPayload'
+    TopicPublish:
+      name: topic.publish
+      title: Publish to a topic
+      summary: Broadcast to all subscribers of a topic.
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/TopicPayload'
+    AckFrame:
+      name: ack
+      title: Message acknowledgment
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/AckPayload'
+    ConnectionReady:
+      name: connection
+      title: Connection established
+      payload:
+        $ref: '#/components/schemas/ConnectionNotice'
+    DirectSent:
+      name: sent
+      title: Direct delivery confirmation
+      payload:
+        $ref: '#/components/schemas/DeliveryReceipt'
+    TopicSent:
+      name: topic_sent
+      title: Topic broadcast confirmation
+      payload:
+        $ref: '#/components/schemas/DeliveryReceipt'
+    InboundDirect:
+      name: inbound.direct
+      title: Direct message delivered from another client
+      payload:
+        $ref: '#/components/schemas/DirectPayload'
+    InboundTopic:
+      name: inbound.topic
+      title: Topic message delivered from a subscribed topic
+      payload:
+        $ref: '#/components/schemas/TopicPayload'
+    ErrorFrame:
+      name: error
+      title: Error frame
+      payload:
+        $ref: '#/components/schemas/ErrorPayload'
+    StatusUpdate:
+      name: status.updated
+      title: Compatibility and maintenance notifications
+      payload:
+        $ref: '#/components/schemas/StatusPayload'

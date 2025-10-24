@@ -1,4 +1,4 @@
-"""Redis repository with fallback storage and health monitoring."""
+"""Redis repository for WebSocket connections, client data, and topics. With fallback storage and health monitoring."""
 
 from __future__ import annotations
 
@@ -11,6 +11,12 @@ from typing import Any, Callable
 
 import redis
 
+from collections import defaultdict
+from uuid import UUID
+
+import redis
+
+from config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +197,10 @@ class InMemoryFallbackStore:
                 for client_uuid, topics in self.client_topics.items()
             },
         }
+
+_settings = get_settings()
+TOKEN_META_PREFIX = f"{_settings.redis_token_prefix}_meta"
+CLIENT_TOKEN_SET_PREFIX = "client_tokens"
 
 
 class RedisStore:
@@ -405,9 +415,21 @@ class RedisStore:
         except RedisUnavailableError as exc:
             self._backfill_needed = True
             raise RedisUnavailableError(exc.args[0], fallback_result=True) from exc
+    
+    def get_client_metadata(self, client_uuid: str) -> Optional[Dict]:
+        """
+        Get client metadata.
+        
+        Args:
+            client_uuid: Client's UUID
+            
+        Returns:
+            Metadata dictionary or None
+        """
+        if not self.client:
+            metadata = self.fallback_clients.get(client_uuid, {}).get("metadata")
+            return metadata
 
-    def get_client_metadata(self, client_uuid: str) -> dict[str, Any] | None:
-        fallback_value = self.fallback.get_client_metadata(client_uuid)
         try:
             def op() -> dict[str, Any] | None:
                 data = self._client.get(f"client:{client_uuid}:metadata")

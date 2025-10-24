@@ -30,7 +30,8 @@ class SwiftyClient:
         self.server_url = server_url.rstrip('/')
         self.name = name
         self.uuid = uuid4()
-        self.token = None
+        self.access_token = None
+        self.refresh_token = None
         self.ws = None
     
     def register(self):
@@ -47,9 +48,13 @@ class SwiftyClient:
         
         if response.status_code == 200:
             data = response.json()
-            self.token = data["token"]
+            self.access_token = data.get("access_token")
+            self.refresh_token = data.get("refresh_token")
             print(f"✓ Registration successful!")
-            print(f"  Token: {self.token[:50]}...")
+            if self.access_token:
+                print(f"  Access token: {self.access_token[:50]}...")
+            if self.refresh_token:
+                print(f"  Refresh token: {self.refresh_token[:50]}...")
             return True
         else:
             print(f"✗ Registration failed: {response.text}")
@@ -57,12 +62,12 @@ class SwiftyClient:
     
     async def connect(self):
         """Connect to WebSocket endpoint."""
-        if not self.token:
+        if not self.access_token:
             print("✗ No token available. Please register first.")
             return False
-        
+
         ws_url = self.server_url.replace('http://', 'ws://').replace('https://', 'wss://')
-        uri = f"{ws_url}/ws?token={self.token}"
+        uri = f"{ws_url}/ws?token={self.access_token}"
         
         print(f"Connecting to WebSocket...")
         try:
@@ -79,11 +84,20 @@ class SwiftyClient:
             async for message in self.ws:
                 data = json.loads(message)
                 print(f"\n📨 Received: {json.dumps(data, indent=2)}")
+
+                # Automatically acknowledge messages that request delivery confirmation
+                if (
+                    isinstance(data, dict)
+                    and data.get("acknowledge")
+                    and data.get("type") not in {"ack", "ack_received", "delivery_update"}
+                    and "msgid" in data
+                ):
+                    await self.send_ack(data["msgid"])
         except websockets.exceptions.ConnectionClosed:
             print("\n✗ Connection closed")
         except Exception as e:
             print(f"\n✗ Error receiving messages: {e}")
-    
+
     async def send_message(self, to_uuid: str, content: str, **kwargs):
         """
         Send a message to another client.
@@ -111,6 +125,22 @@ class SwiftyClient:
         
         print(f"\n📤 Sending message to {to_uuid}...")
         await self.ws.send(json.dumps(message))
+
+    async def send_ack(self, msgid: str, status: str = "delivered"):
+        """Send an acknowledgment for a received message."""
+        if not self.ws:
+            return
+
+        ack_payload = {
+            "type": "ack",
+            "msgid": msgid,
+            "from": str(self.uuid),
+            "timestamp": time.time(),
+            "status": status,
+        }
+
+        print(f"\n✅ Sending acknowledgment for {msgid} with status '{status}'")
+        await self.ws.send(json.dumps(ack_payload))
     
     async def run_interactive(self):
         """Run client in interactive mode."""
