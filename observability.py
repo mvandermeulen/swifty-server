@@ -7,7 +7,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, cast
 
 from fastapi import FastAPI
 from fastapi.responses import Response
@@ -41,35 +41,35 @@ except ModuleNotFoundError:  # pragma: no cover - executed when prometheus not i
     generate_latest = _generate_latest  # type: ignore[assignment]
 
 try:  # pragma: no cover - optional dependency
-    from opentelemetry import trace as _ot_trace
+    from opentelemetry import trace as _imported_ot_trace
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
-        OTLPSpanExporter as _OTLPSpanExporter,
+        OTLPSpanExporter as _imported_OTLPSpanExporter,
     )
     from opentelemetry.instrumentation.fastapi import (
-        FastAPIInstrumentor as _FastAPIInstrumentor,
+        FastAPIInstrumentor as _imported_FastAPIInstrumentor,
     )
-    from opentelemetry.sdk.resources import Resource as _Resource
-    from opentelemetry.sdk.trace import TracerProvider as _TracerProvider
+    from opentelemetry.sdk.resources import Resource as _imported_Resource
+    from opentelemetry.sdk.trace import TracerProvider as _imported_TracerProvider
     from opentelemetry.sdk.trace.export import (
-        BatchSpanProcessor as _BatchSpanProcessor,
-        ConsoleSpanExporter as _ConsoleSpanExporter,
+        BatchSpanProcessor as _imported_BatchSpanProcessor,
+        ConsoleSpanExporter as _imported_ConsoleSpanExporter,
     )
 except ModuleNotFoundError:  # pragma: no cover - executed when tracing not installed
-    _ot_trace = None
-    _OTLPSpanExporter = None
-    _FastAPIInstrumentor = None
-    _Resource = None
-    _TracerProvider = None
-    _BatchSpanProcessor = None
-    _ConsoleSpanExporter = None
+    _imported_ot_trace = cast(Any, None)
+    _imported_OTLPSpanExporter = cast(Any, None)
+    _imported_FastAPIInstrumentor = cast(Any, None)
+    _imported_Resource = cast(Any, None)
+    _imported_TracerProvider = cast(Any, None)
+    _imported_BatchSpanProcessor = cast(Any, None)
+    _imported_ConsoleSpanExporter = cast(Any, None)
 
-ot_trace = _ot_trace
-OTLPSpanExporter = _OTLPSpanExporter
-FastAPIInstrumentor = _FastAPIInstrumentor
-Resource = _Resource
-TracerProvider = _TracerProvider
-BatchSpanProcessor = _BatchSpanProcessor
-ConsoleSpanExporter = _ConsoleSpanExporter
+ot_trace = cast(Any, _imported_ot_trace)
+OTLPSpanExporter = cast(Any, _imported_OTLPSpanExporter)
+FastAPIInstrumentor = cast(Any, _imported_FastAPIInstrumentor)
+Resource = cast(Any, _imported_Resource)
+TracerProvider = cast(Any, _imported_TracerProvider)
+BatchSpanProcessor = cast(Any, _imported_BatchSpanProcessor)
+ConsoleSpanExporter = cast(Any, _imported_ConsoleSpanExporter)
 
 __all__ = [
     "CONNECTION_EVENTS",
