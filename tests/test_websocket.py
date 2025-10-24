@@ -3,7 +3,6 @@ import json
 import time
 from uuid import uuid4
 
-import pytest
 from fastapi import WebSocketDisconnect
 
 import main

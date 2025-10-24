@@ -13,7 +13,6 @@ import json
 import requests
 from uuid import uuid4
 import time
-import sys
 
 
 class TopicClient:
