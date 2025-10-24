@@ -27,30 +27,49 @@ except ModuleNotFoundError:  # pragma: no cover - executed when prometheus not i
         def set(self, *_args: Any, **_kwargs: Any) -> None:
             return None
 
-    def Counter(*_args: Any, **_kwargs: Any) -> _NoOpMetric:  # type: ignore[misc]
+    def _counter(*_args: Any, **_kwargs: Any) -> _NoOpMetric:
         return _NoOpMetric()
 
-    def Gauge(*_args: Any, **_kwargs: Any) -> _NoOpMetric:  # type: ignore[misc]
+    def _gauge(*_args: Any, **_kwargs: Any) -> _NoOpMetric:
         return _NoOpMetric()
 
-    def generate_latest() -> bytes:  # type: ignore[misc]
+    def _generate_latest() -> bytes:
         return b""
 
+    Counter = _counter  # type: ignore[assignment]
+    Gauge = _gauge  # type: ignore[assignment]
+    generate_latest = _generate_latest  # type: ignore[assignment]
+
 try:  # pragma: no cover - optional dependency
-    from opentelemetry import trace as ot_trace
-    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-    from opentelemetry.sdk.resources import Resource
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
+    from opentelemetry import trace as _ot_trace
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+        OTLPSpanExporter as _OTLPSpanExporter,
+    )
+    from opentelemetry.instrumentation.fastapi import (
+        FastAPIInstrumentor as _FastAPIInstrumentor,
+    )
+    from opentelemetry.sdk.resources import Resource as _Resource
+    from opentelemetry.sdk.trace import TracerProvider as _TracerProvider
+    from opentelemetry.sdk.trace.export import (
+        BatchSpanProcessor as _BatchSpanProcessor,
+        ConsoleSpanExporter as _ConsoleSpanExporter,
+    )
 except ModuleNotFoundError:  # pragma: no cover - executed when tracing not installed
-    ot_trace = None
-    OTLPSpanExporter = None
-    FastAPIInstrumentor = None
-    Resource = None
-    TracerProvider = None
-    BatchSpanProcessor = None
-    ConsoleSpanExporter = None
+    _ot_trace = None
+    _OTLPSpanExporter = None
+    _FastAPIInstrumentor = None
+    _Resource = None
+    _TracerProvider = None
+    _BatchSpanProcessor = None
+    _ConsoleSpanExporter = None
+
+ot_trace = _ot_trace
+OTLPSpanExporter = _OTLPSpanExporter
+FastAPIInstrumentor = _FastAPIInstrumentor
+Resource = _Resource
+TracerProvider = _TracerProvider
+BatchSpanProcessor = _BatchSpanProcessor
+ConsoleSpanExporter = _ConsoleSpanExporter
 
 __all__ = [
     "CONNECTION_EVENTS",
@@ -171,7 +190,13 @@ _tracing_configured = False
 def configure_tracing(app: FastAPI) -> None:
     """Configure OpenTelemetry tracing for the FastAPI application."""
 
-    if not (ot_trace and TracerProvider and FastAPIInstrumentor and BatchSpanProcessor):
+    if (
+        ot_trace is None
+        or TracerProvider is None
+        or FastAPIInstrumentor is None
+        or BatchSpanProcessor is None
+        or Resource is None
+    ):
         return
 
     global _tracing_configured
@@ -182,11 +207,13 @@ def configure_tracing(app: FastAPI) -> None:
     provider = TracerProvider(resource=resource)
 
     otlp_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-    if otlp_endpoint:
+    if otlp_endpoint and OTLPSpanExporter is not None:
         headers_raw = os.getenv("OTEL_EXPORTER_OTLP_HEADERS", "")
         headers = _parse_otlp_headers(headers_raw) if headers_raw else None
         span_processor = BatchSpanProcessor(OTLPSpanExporter(endpoint=otlp_endpoint, headers=headers))
     else:
+        if ConsoleSpanExporter is None:
+            return
         span_processor = BatchSpanProcessor(ConsoleSpanExporter())
 
     provider.add_span_processor(span_processor)
