@@ -37,11 +37,11 @@ from auth import (
     revoke_client_tokens,
 )
 from connection_manager import ConnectionManager
+from observability import ERROR_COUNTER, MESSAGE_COUNTER, configure_observability, get_tracer
 from redis_store import RedisOperationError, RedisUnavailableError, redis_store
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+tracer = get_tracer("swifty.main")
 
 # Create FastAPI app
 app = FastAPI(
@@ -49,6 +49,8 @@ app = FastAPI(
     description="FastAPI WebSocket Server for Real-Time Communications",
     version="1.0.0",
 )
+
+configure_observability(app)
 
 # Create connection manager
 manager = ConnectionManager()
@@ -129,8 +131,16 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
             status_code = response.status_code
         except HTTPException as exc:
             status_code = exc.status_code
+            ERROR_COUNTER.labels(type="http_exception").inc()
             logger.warning(
-                "HTTP exception for %s %s: %s", request.method, request.url.path, exc.detail
+                "http_exception",
+                extra={
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status_code": status_code,
+                    "detail": exc.detail,
+                    "correlation_id": correlation_id,
+                },
             )
             response = JSONResponse(status_code=status_code, content={"detail": exc.detail})
             if exc.headers:
@@ -138,8 +148,15 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
                     response.headers[header] = value
         except RequestValidationError as exc:
             status_code = 422
+            ERROR_COUNTER.labels(type="validation_error").inc()
             logger.warning(
-                "Validation error processing %s %s: %s", request.method, request.url.path, exc.errors()
+                "request_validation_error",
+                extra={
+                    "method": request.method,
+                    "path": request.url.path,
+                    "errors": exc.errors(),
+                    "correlation_id": correlation_id,
+                },
             )
             response = JSONResponse(
                 status_code=status_code,
@@ -147,8 +164,14 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
             )
         except Exception as exc:  # noqa: BLE001
             status_code = 500
+            ERROR_COUNTER.labels(type="http_internal_error").inc()
             logger.exception(
-                "Unhandled error processing %s %s: %s", request.method, request.url.path, exc
+                "unhandled_http_error",
+                extra={
+                    "method": request.method,
+                    "path": request.url.path,
+                    "correlation_id": correlation_id,
+                },
             )
             response = JSONResponse(
                 status_code=status_code,
@@ -158,12 +181,14 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         response.headers["X-Correlation-ID"] = correlation_id
         process_time_ms = (time.time() - start_time) * 1000
         logger.info(
-            "HTTP %s %s -> %s (%.2f ms) cid=%s",
-            request.method,
-            request.url.path,
-            status_code,
-            process_time_ms,
-            correlation_id,
+            "http_request_completed",
+            extra={
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": status_code,
+                "duration_ms": round(process_time_ms, 2),
+                "correlation_id": correlation_id,
+            },
         )
         return response
 
@@ -195,6 +220,9 @@ async def root():
             "create_topic": "/topics/create",
             "subscribe": "/topics/subscribe",
             "unsubscribe": "/topics/unsubscribe",
+            "health_live": "/health/live",
+            "health_ready": "/health/ready",
+            "metrics": "/metrics",
             "redis_health": "/health/redis",
             "delivery_status": "/messages/{msgid}/status",
             "undelivered": "/clients/{uuid}/undelivered",
@@ -203,6 +231,38 @@ async def root():
             "revoke_tokens": "/admin/tokens/revoke",
         }
     }
+
+
+@app.get("/health/live")
+async def health_live() -> dict[str, Any]:
+    """Liveness probe that confirms the application is running."""
+
+    return {
+        "status": "live",
+        "app": "ok",
+        "timestamp": time.time(),
+    }
+
+
+@app.get("/health/ready")
+async def health_ready() -> JSONResponse:
+    """Readiness probe that reports dependency health."""
+
+    redis_status = redis_store.check_health()
+    worker_health = manager.get_worker_health()
+    redis_ready = bool(redis_status.get("redis"))
+    worker_ready = worker_health["running"] or worker_health["pending_deliveries"] == 0
+    ready = redis_ready and worker_ready
+
+    payload = {
+        "status": "ready" if ready else "degraded",
+        "app": "ok" if ready else "initializing",
+        "redis": redis_status,
+        "worker": worker_health,
+        "timestamp": time.time(),
+    }
+    status_code = 200 if ready else 503
+    return JSONResponse(status_code=status_code, content=payload)
 
 
 @app.post("/register")
@@ -219,7 +279,13 @@ async def register_client(registration: ClientRegistration):
     try:
         tokens = issue_token_pair(registration.uuid, registration.name)
 
-        logger.info(f"Client registered: {registration.name} ({registration.uuid})")
+        logger.info(
+            "client_registered",
+            extra={
+                "client_uuid": str(registration.uuid),
+                "client_name": registration.name,
+            },
+        )
 
         return {
             "access_token": tokens["access_token"],
@@ -235,7 +301,11 @@ async def register_client(registration: ClientRegistration):
             "message": "Registration successful"
         }
     except Exception as e:
-        logger.error(f"Registration error: {e}")
+        ERROR_COUNTER.labels(type="registration_error").inc()
+        logger.error(
+            "registration_error",
+            extra={"client_uuid": str(registration.uuid), "error": str(e)},
+        )
         raise http_exception(
             status_code=500,
             code=ErrorCode.REGISTRATION_FAILED,
@@ -666,264 +736,294 @@ async def admin_revoke_tokens(
 @app.websocket("/ws")
 async def websocket_endpoint(
     websocket: WebSocket,
-    token: str = Query(..., description="JWT authentication token")
+    token: str = Query(..., description="JWT authentication token"),
 ):
-    """
-    WebSocket endpoint for real-time messaging.
-    
-    Clients must provide a valid JWT token obtained from /register.
-    Messages are routed to recipients by their UUID.
-    
-    Args:
-        websocket: WebSocket connection
-        token: JWT authentication token
-    """
-    # Verify token
+    """Primary WebSocket endpoint used by registered clients."""
+
     payload = verify_token(token, expected_type="access")
     if not payload:
         await websocket.accept()
-        await websocket.send_json(
-            websocket_error_frame(
-                ErrorCode.INVALID_TOKEN,
-                "Invalid token",
-                "Request a new access token via /auth/refresh and reconnect.",
-            )
+        ERROR_COUNTER.labels(type="websocket_auth").inc()
+        error_frame = websocket_error_frame(
+            ErrorCode.INVALID_TOKEN,
+            "Invalid token",
+            "Request a new access token via /auth/refresh and reconnect.",
         )
+        await websocket.send_json(error_frame)
+        MESSAGE_COUNTER.labels(direction="outbound", channel="websocket").inc()
         await websocket.close(code=1008, reason="Invalid token")
         return
-    
+
     client_uuid = UUID(payload["sub"])
     client_name = payload["name"]
-    
-    # Connect client
-    await manager.connect(websocket, client_uuid, client_name)
-    
-    try:
-        # Send welcome message
-        await websocket.send_json({
-            "type": "connection",
-            "message": "Connected successfully",
-            "uuid": str(client_uuid),
-            "name": client_name,
-            "timestamp": time.time()
-        })
-        
-        # Listen for messages
-        while True:
-            # Receive message
-            data = await websocket.receive_text()
-            
-            try:
-                message_data = json.loads(data)
 
-                # Handle delivery acknowledgments
-                if message_data.get("type") == "ack":
+    async def send_payload(payload: dict[str, Any]) -> None:
+        await websocket.send_json(payload)
+        MESSAGE_COUNTER.labels(direction="outbound", channel="websocket").inc()
+
+    session_attributes = {
+        "client.uuid": str(client_uuid),
+        "client.name": client_name,
+    }
+
+    with tracer.start_as_current_span("websocket.session", attributes=session_attributes):
+        await manager.connect(websocket, client_uuid, client_name)
+        logger.info(
+            "websocket_client_connected",
+            extra={"client_uuid": str(client_uuid), "client_name": client_name},
+        )
+
+        try:
+            await send_payload(
+                {
+                    "type": "connection",
+                    "message": "Connected successfully",
+                    "uuid": str(client_uuid),
+                    "name": client_name,
+                    "timestamp": time.time(),
+                }
+            )
+
+            while True:
+                data = await websocket.receive_text()
+                MESSAGE_COUNTER.labels(direction="inbound", channel="websocket").inc()
+
+                with tracer.start_as_current_span(
+                    "websocket.message",
+                    attributes={"client.uuid": str(client_uuid)},
+                ):
                     try:
-                        acknowledgment = MessageAcknowledgment(**message_data)
-                    except Exception as validation_error:
-                        await websocket.send_json(
-                            websocket_error_frame(
-                                ErrorCode.INVALID_ACK,
-                                f"Invalid acknowledgment format: {validation_error}",
-                                "Ensure acknowledgment payload matches the documented schema and resend.",
-                                details={"error": str(validation_error)},
-                            )
-                        )
-                        continue
-
-                    if acknowledgment.from_ != client_uuid:
-                        await websocket.send_json(
-                            websocket_error_frame(
-                                ErrorCode.ACK_SENDER_MISMATCH,
-                                "Acknowledgment sender mismatch",
-                                "Resend the acknowledgment using your authenticated client UUID.",
-                                details={
-                                    "expected": str(client_uuid),
-                                    "received": str(acknowledgment.from_),
-                                },
-                            )
-                        )
-                        continue
-
-                    await manager.handle_acknowledgment(
-                        str(acknowledgment.msgid),
-                        acknowledgment.status,
-                        str(client_uuid)
-                    )
-
-                    await websocket.send_json({
-                        "type": "ack_received",
-                        "msgid": str(acknowledgment.msgid),
-                        "status": acknowledgment.status,
-                        "timestamp": time.time()
-                    })
-                    continue
-
-                # Check if this is a topic message
-                if "topic_id" in message_data:
-                    # Handle topic message
-                    try:
-                        topic_msg = TopicMessage(**message_data)
-                    except Exception as validation_error:
-                        await websocket.send_json(
-                            websocket_error_frame(
-                                ErrorCode.INVALID_TOPIC_MESSAGE,
-                                f"Invalid topic message format: {validation_error}",
-                                "Ensure topic messages follow the TopicMessage schema and resend.",
-                                details={"error": str(validation_error)},
-                            )
-                        )
-                        continue
-
-                    # Verify sender UUID matches authenticated client
-                    if topic_msg.from_ != client_uuid:
-                        await websocket.send_json(
-                            websocket_error_frame(
-                                ErrorCode.MESSAGE_SENDER_MISMATCH,
-                                "Sender UUID does not match authenticated client",
-                                "Send the topic message using your authenticated client UUID.",
-                                details={
-                                    "expected": str(client_uuid),
-                                    "received": str(topic_msg.from_),
-                                },
-                            )
-                        )
-                        continue
-                    
-                    # Verify topic exists
-                    try:
-                        topic = redis_store.get_topic(topic_msg.topic_id)
-                    except RedisUnavailableError as exc:
-                        topic = exc.fallback_result
-                    except RedisOperationError as exc:
-                        logger.error(
-                            "Error fetching topic %s for websocket message: %s",
-                            topic_msg.topic_id,
-                            exc,
-                        )
-                        topic = None
-                    if not topic:
-                        await websocket.send_json(
-                            websocket_error_frame(
-                                ErrorCode.TOPIC_NOT_FOUND,
-                                f"Topic {topic_msg.topic_id} not found",
-                                "Create the topic first or verify the topic identifier before retrying.",
-                                details={"topic_id": topic_msg.topic_id},
-                            )
-                        )
-                        continue
-
-                    # Verify sender is subscribed to topic
-                    try:
-                        subscribers = redis_store.get_topic_subscribers(topic_msg.topic_id)
-                    except RedisUnavailableError as exc:
-                        subscribers = exc.fallback_result or set()
-                    except RedisOperationError as exc:
-                        logger.error(
-                            "Error fetching subscribers for topic %s: %s",
-                            topic_msg.topic_id,
-                            exc,
-                        )
-                        subscribers = set()
-
-                    if str(client_uuid) not in subscribers:
-                        await websocket.send_json(
-                            websocket_error_frame(
-                                ErrorCode.NOT_SUBSCRIBED_TO_TOPIC,
-                                f"Not subscribed to topic {topic_msg.topic_id}",
-                                "Subscribe to the topic before publishing messages to it.",
-                                details={"topic_id": topic_msg.topic_id},
-                            )
-                        )
-                        continue
-                    
-                    # Broadcast to topic subscribers
-                    sent_count = await manager.broadcast_to_topic(
-                        topic_msg.topic_id,
-                        message_data,
-                        exclude=client_uuid
-                    )
-                    
-                    # Send confirmation to sender
-                    await websocket.send_json({
-                        "type": "topic_sent",
-                        "message": f"Message sent to {sent_count} subscribers",
-                        "topic_id": topic_msg.topic_id,
-                        "msgid": str(topic_msg.msgid),
-                        "timestamp": time.time()
-                    })
-                
-                else:
-                    # Handle direct message (existing logic)
-                    # Validate message structure
-                    try:
-                        message = Message(**message_data)
-                    except Exception as validation_error:
-                        await websocket.send_json(
+                        message_data = json.loads(data)
+                    except json.JSONDecodeError:
+                        ERROR_COUNTER.labels(type="websocket_invalid_json").inc()
+                        await send_payload(
                             websocket_error_frame(
                                 ErrorCode.INVALID_MESSAGE_FORMAT,
-                                f"Invalid message format: {validation_error}",
-                                "Ensure direct messages follow the documented schema and resend.",
-                                details={"error": str(validation_error)},
+                                "Invalid JSON format",
+                                "Send JSON-encoded text frames that conform to the message schema.",
                             )
                         )
                         continue
 
-                    # Verify sender UUID matches authenticated client
-                    if message.from_ != client_uuid:
-                        await websocket.send_json(
-                            websocket_error_frame(
-                                ErrorCode.MESSAGE_SENDER_MISMATCH,
-                                "Sender UUID does not match authenticated client",
-                                "Send the message using your authenticated client UUID.",
-                                details={
-                                    "expected": str(client_uuid),
-                                    "received": str(message.from_),
-                                },
+                    if message_data.get("type") == "ack":
+                        with tracer.start_as_current_span(
+                            "websocket.ack",
+                            attributes={"message.id": str(message_data.get("msgid"))},
+                        ):
+                            try:
+                                acknowledgment = MessageAcknowledgment(**message_data)
+                            except Exception as validation_error:
+                                ERROR_COUNTER.labels(type="websocket_invalid_ack").inc()
+                                await send_payload(
+                                    websocket_error_frame(
+                                        ErrorCode.INVALID_ACK,
+                                        f"Invalid acknowledgment format: {validation_error}",
+                                        "Ensure acknowledgment payload matches the documented schema and resend.",
+                                        details={"error": str(validation_error)},
+                                    )
+                                )
+                                continue
+
+                            if acknowledgment.from_ != client_uuid:
+                                ERROR_COUNTER.labels(type="ack_sender_mismatch").inc()
+                                await send_payload(
+                                    websocket_error_frame(
+                                        ErrorCode.ACK_SENDER_MISMATCH,
+                                        "Acknowledgment sender mismatch",
+                                        "Resend the acknowledgment using your authenticated client UUID.",
+                                        details={
+                                            "expected": str(client_uuid),
+                                            "received": str(acknowledgment.from_),
+                                        },
+                                    )
+                                )
+                                continue
+
+                            await manager.handle_acknowledgment(
+                                str(acknowledgment.msgid),
+                                acknowledgment.status,
+                                str(client_uuid),
                             )
-                        )
+
+                            await send_payload(
+                                {
+                                    "type": "ack_received",
+                                    "msgid": str(acknowledgment.msgid),
+                                    "status": acknowledgment.status,
+                                    "timestamp": time.time(),
+                                }
+                            )
                         continue
 
-                    # Route message to recipient
-                    delivery_result = await manager.send_message(
-                        message_data,
-                        message.to
-                    )
+                    if "topic_id" in message_data:
+                        with tracer.start_as_current_span(
+                            "websocket.topic_message",
+                            attributes={
+                                "topic.id": message_data.get("topic_id"),
+                                "message.id": str(message_data.get("msgid")),
+                            },
+                        ):
+                            try:
+                                topic_msg = TopicMessage(**message_data)
+                            except Exception as validation_error:
+                                ERROR_COUNTER.labels(type="websocket_invalid_topic").inc()
+                                await send_payload(
+                                    websocket_error_frame(
+                                        ErrorCode.INVALID_TOPIC_MESSAGE,
+                                        f"Invalid topic message format: {validation_error}",
+                                        "Ensure topic messages follow the TopicMessage schema and resend.",
+                                        details={"error": str(validation_error)},
+                                    )
+                                )
+                                continue
 
-                    await websocket.send_json({
-                        "type": "delivery_status",
-                        "status": delivery_result.status,
-                        "message": delivery_result.detail,
-                        "msgid": str(message.msgid),
-                        "timestamp": time.time(),
-                        "acknowledge": message.acknowledge,
-                    })
-                    
-            except json.JSONDecodeError:
-                await websocket.send_json(
-                    websocket_error_frame(
-                        ErrorCode.INVALID_MESSAGE_FORMAT,
-                        "Invalid JSON format",
-                        "Send JSON-encoded text frames that conform to the message schema.",
-                    )
-                )
-            except Exception as e:  # noqa: BLE001
-                logger.exception("Error processing message: %s", e)
-                await websocket.send_json(
-                    websocket_error_frame(
-                        ErrorCode.INTERNAL_SERVER_ERROR,
-                        "Error processing message",
-                        "Retry the action or reconnect if the problem persists.",
-                        details={"error": str(e)},
-                    )
-                )
-                
-    except WebSocketDisconnect:
-        manager.disconnect(client_uuid)
-        logger.info(f"Client disconnected: {client_name} ({client_uuid})")
-    except Exception as e:
-        logger.error(f"WebSocket error for {client_name}: {e}")
-        manager.disconnect(client_uuid)
+                            if topic_msg.from_ != client_uuid:
+                                ERROR_COUNTER.labels(type="topic_sender_mismatch").inc()
+                                await send_payload(
+                                    websocket_error_frame(
+                                        ErrorCode.MESSAGE_SENDER_MISMATCH,
+                                        "Sender UUID does not match authenticated client",
+                                        "Send the topic message using your authenticated client UUID.",
+                                        details={
+                                            "expected": str(client_uuid),
+                                            "received": str(topic_msg.from_),
+                                        },
+                                    )
+                                )
+                                continue
+
+                            try:
+                                topic = redis_store.get_topic(topic_msg.topic_id)
+                            except RedisUnavailableError as exc:
+                                topic = exc.fallback_result
+                            except RedisOperationError as exc:
+                                ERROR_COUNTER.labels(type="topic_lookup_error").inc()
+                                logger.error(
+                                    "websocket_topic_lookup_error",
+                                    extra={
+                                        "topic_id": topic_msg.topic_id,
+                                        "error": str(exc),
+                                    },
+                                )
+                                topic = None
+                            if not topic:
+                                ERROR_COUNTER.labels(type="topic_missing").inc()
+                                await send_payload(
+                                    websocket_error_frame(
+                                        ErrorCode.TOPIC_NOT_FOUND,
+                                        f"Topic {topic_msg.topic_id} not found",
+                                        "Create the topic first or verify the topic identifier before retrying.",
+                                        details={"topic_id": topic_msg.topic_id},
+                                    )
+                                )
+                                continue
+
+                            try:
+                                subscribers = redis_store.get_topic_subscribers(topic_msg.topic_id)
+                            except RedisUnavailableError as exc:
+                                subscribers = exc.fallback_result or set()
+                            except RedisOperationError as exc:
+                                ERROR_COUNTER.labels(type="topic_subscriber_error").inc()
+                                logger.error(
+                                    "websocket_subscriber_lookup_error",
+                                    extra={
+                                        "topic_id": topic_msg.topic_id,
+                                        "error": str(exc),
+                                    },
+                                )
+                                subscribers = set()
+
+                            if str(client_uuid) not in subscribers:
+                                ERROR_COUNTER.labels(type="topic_not_subscribed").inc()
+                                await send_payload(
+                                    websocket_error_frame(
+                                        ErrorCode.NOT_SUBSCRIBED_TO_TOPIC,
+                                        f"Not subscribed to topic {topic_msg.topic_id}",
+                                        "Subscribe to the topic before publishing messages to it.",
+                                        details={"topic_id": topic_msg.topic_id},
+                                    )
+                                )
+                                continue
+
+                            sent_count = await manager.broadcast_to_topic(
+                                topic_msg.topic_id,
+                                message_data,
+                                exclude=client_uuid,
+                            )
+
+                            await send_payload(
+                                {
+                                    "type": "topic_sent",
+                                    "message": f"Message sent to {sent_count} subscribers",
+                                    "topic_id": topic_msg.topic_id,
+                                    "msgid": str(topic_msg.msgid),
+                                    "timestamp": time.time(),
+                                }
+                            )
+                        continue
+
+                    with tracer.start_as_current_span(
+                        "websocket.direct_message",
+                        attributes={"message.id": str(message_data.get("msgid"))},
+                    ):
+                        try:
+                            message = Message(**message_data)
+                        except Exception as validation_error:
+                            ERROR_COUNTER.labels(type="websocket_invalid_message").inc()
+                            await send_payload(
+                                websocket_error_frame(
+                                    ErrorCode.INVALID_MESSAGE_FORMAT,
+                                    f"Invalid message format: {validation_error}",
+                                    "Ensure direct messages follow the documented schema and resend.",
+                                    details={"error": str(validation_error)},
+                                )
+                            )
+                            continue
+
+                        if message.from_ != client_uuid:
+                            ERROR_COUNTER.labels(type="direct_sender_mismatch").inc()
+                            await send_payload(
+                                websocket_error_frame(
+                                    ErrorCode.MESSAGE_SENDER_MISMATCH,
+                                    "Sender UUID does not match authenticated client",
+                                    "Send the message using your authenticated client UUID.",
+                                    details={
+                                        "expected": str(client_uuid),
+                                        "received": str(message.from_),
+                                    },
+                                )
+                            )
+                            continue
+
+                        delivery_result = await manager.send_message(
+                            message_data,
+                            message.to,
+                        )
+
+                        await send_payload(
+                            {
+                                "type": "delivery_status",
+                                "status": delivery_result.status,
+                                "message": delivery_result.detail,
+                                "msgid": str(message.msgid),
+                                "timestamp": time.time(),
+                                "acknowledge": message.acknowledge,
+                            }
+                        )
+
+        except WebSocketDisconnect:
+            manager.disconnect(client_uuid)
+            logger.info(
+                "websocket_client_disconnected",
+                extra={"client_uuid": str(client_uuid), "client_name": client_name},
+            )
+        except Exception as exc:  # noqa: BLE001
+            ERROR_COUNTER.labels(type="websocket_error").inc()
+            logger.exception(
+                "websocket_session_error",
+                extra={"client_uuid": str(client_uuid), "client_name": client_name},
+            )
+            manager.disconnect(client_uuid)
 
 
 if __name__ == "__main__":
