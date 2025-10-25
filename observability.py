@@ -7,13 +7,16 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, cast
+from typing import Any, Dict
 
 from fastapi import FastAPI
 from fastapi.responses import Response
 
 try:  # pragma: no cover - optional dependency
-    from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, generate_latest
+    from prometheus_client import CONTENT_TYPE_LATEST
+    from prometheus_client import Counter as _prom_counter
+    from prometheus_client import Gauge as _prom_gauge
+    from prometheus_client import generate_latest as _prom_generate_latest
 except ModuleNotFoundError:  # pragma: no cover - executed when prometheus not installed
     CONTENT_TYPE_LATEST = "text/plain; version=0.0.4"
 
@@ -27,49 +30,49 @@ except ModuleNotFoundError:  # pragma: no cover - executed when prometheus not i
         def set(self, *_args: Any, **_kwargs: Any) -> None:
             return None
 
-    def _counter(*_args: Any, **_kwargs: Any) -> _NoOpMetric:
+    def _prom_counter(*_args: Any, **_kwargs: Any) -> _NoOpMetric:
         return _NoOpMetric()
 
-    def _gauge(*_args: Any, **_kwargs: Any) -> _NoOpMetric:
+    def _prom_gauge(*_args: Any, **_kwargs: Any) -> _NoOpMetric:
         return _NoOpMetric()
 
-    def _generate_latest() -> bytes:
+    def _prom_generate_latest(*_args: Any, **_kwargs: Any) -> bytes:
         return b""
 
-    Counter = _counter  # type: ignore[misc]
-    Gauge = _gauge  # type: ignore[misc]
-    generate_latest = _generate_latest  # type: ignore[misc]
+Counter: Any = _prom_counter
+Gauge: Any = _prom_gauge
+generate_latest: Any = _prom_generate_latest
 
 try:  # pragma: no cover - optional dependency
-    from opentelemetry import trace as _imported_ot_trace
+    from opentelemetry import trace as _ot_trace
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
-        OTLPSpanExporter as _imported_OTLPSpanExporter,
+        OTLPSpanExporter as _OTLPSpanExporter,
     )
     from opentelemetry.instrumentation.fastapi import (
-        FastAPIInstrumentor as _imported_FastAPIInstrumentor,
+        FastAPIInstrumentor as _FastAPIInstrumentor,
     )
-    from opentelemetry.sdk.resources import Resource as _imported_Resource
-    from opentelemetry.sdk.trace import TracerProvider as _imported_TracerProvider
+    from opentelemetry.sdk.resources import Resource as _Resource
+    from opentelemetry.sdk.trace import TracerProvider as _TracerProvider
     from opentelemetry.sdk.trace.export import (
-        BatchSpanProcessor as _imported_BatchSpanProcessor,
-        ConsoleSpanExporter as _imported_ConsoleSpanExporter,
+        BatchSpanProcessor as _BatchSpanProcessor,
+        ConsoleSpanExporter as _ConsoleSpanExporter,
     )
 except ModuleNotFoundError:  # pragma: no cover - executed when tracing not installed
-    _imported_ot_trace = cast(Any, None)
-    _imported_OTLPSpanExporter = cast(Any, None)
-    _imported_FastAPIInstrumentor = cast(Any, None)
-    _imported_Resource = cast(Any, None)
-    _imported_TracerProvider = cast(Any, None)
-    _imported_BatchSpanProcessor = cast(Any, None)
-    _imported_ConsoleSpanExporter = cast(Any, None)
+    _ot_trace = None
+    _OTLPSpanExporter = None
+    _FastAPIInstrumentor = None
+    _Resource = None
+    _TracerProvider = None
+    _BatchSpanProcessor = None
+    _ConsoleSpanExporter = None
 
-ot_trace = cast(Any, _imported_ot_trace)
-OTLPSpanExporter = cast(Any, _imported_OTLPSpanExporter)
-FastAPIInstrumentor = cast(Any, _imported_FastAPIInstrumentor)
-Resource = cast(Any, _imported_Resource)
-TracerProvider = cast(Any, _imported_TracerProvider)
-BatchSpanProcessor = cast(Any, _imported_BatchSpanProcessor)
-ConsoleSpanExporter = cast(Any, _imported_ConsoleSpanExporter)
+ot_trace: Any = _ot_trace
+OTLPSpanExporter: Any = _OTLPSpanExporter
+FastAPIInstrumentor: Any = _FastAPIInstrumentor
+Resource: Any = _Resource
+TracerProvider: Any = _TracerProvider
+BatchSpanProcessor: Any = _BatchSpanProcessor
+ConsoleSpanExporter: Any = _ConsoleSpanExporter
 
 __all__ = [
     "CONNECTION_EVENTS",
