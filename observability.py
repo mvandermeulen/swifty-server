@@ -12,11 +12,15 @@ from typing import Any, Dict
 from fastapi import FastAPI
 from fastapi.responses import Response
 
+_counter_impl: Any = None
+_gauge_impl: Any = None
+_generate_latest_impl: Any = None
+
 try:  # pragma: no cover - optional dependency
     from prometheus_client import CONTENT_TYPE_LATEST
-    from prometheus_client import Counter as _prom_counter
-    from prometheus_client import Gauge as _prom_gauge
-    from prometheus_client import generate_latest as _prom_generate_latest
+    from prometheus_client import Counter as _imported_counter
+    from prometheus_client import Gauge as _imported_gauge
+    from prometheus_client import generate_latest as _imported_generate_latest
 except ModuleNotFoundError:  # pragma: no cover - executed when prometheus not installed
     CONTENT_TYPE_LATEST = "text/plain; version=0.0.4"
 
@@ -30,49 +34,63 @@ except ModuleNotFoundError:  # pragma: no cover - executed when prometheus not i
         def set(self, *_args: Any, **_kwargs: Any) -> None:
             return None
 
-    def _prom_counter(*_args: Any, **_kwargs: Any) -> _NoOpMetric:
+    def _fallback_counter(*_args: Any, **_kwargs: Any) -> _NoOpMetric:
         return _NoOpMetric()
 
-    def _prom_gauge(*_args: Any, **_kwargs: Any) -> _NoOpMetric:
+    def _fallback_gauge(*_args: Any, **_kwargs: Any) -> _NoOpMetric:
         return _NoOpMetric()
 
-    def _prom_generate_latest(*_args: Any, **_kwargs: Any) -> bytes:
+    def _fallback_generate_latest(*_args: Any, **_kwargs: Any) -> bytes:
         return b""
 
-Counter: Any = _prom_counter
-Gauge: Any = _prom_gauge
-generate_latest: Any = _prom_generate_latest
+    _counter_impl = _fallback_counter
+    _gauge_impl = _fallback_gauge
+    _generate_latest_impl = _fallback_generate_latest
+else:
+    _counter_impl = _imported_counter
+    _gauge_impl = _imported_gauge
+    _generate_latest_impl = _imported_generate_latest
+
+Counter: Any = _counter_impl
+Gauge: Any = _gauge_impl
+generate_latest: Any = _generate_latest_impl
+
+_trace_mod: Any = None
+_otlp_exporter_cls: Any = None
+_fastapi_instrumentor_cls: Any = None
+_resource_cls: Any = None
+_tracer_provider_cls: Any = None
+_batch_span_processor_cls: Any = None
+_console_span_exporter_cls: Any = None
 
 try:  # pragma: no cover - optional dependency
-    from opentelemetry import trace as _ot_trace
-    from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
-        OTLPSpanExporter as _OTLPSpanExporter,
-    )
-    from opentelemetry.instrumentation.fastapi import (
-        FastAPIInstrumentor as _FastAPIInstrumentor,
-    )
-    from opentelemetry.sdk.resources import Resource as _Resource
-    from opentelemetry.sdk.trace import TracerProvider as _TracerProvider
+    from opentelemetry import trace as _trace_module
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter as _otlp_exporter_type
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor as _fastapi_instrumentor_type
+    from opentelemetry.sdk.resources import Resource as _resource_type
+    from opentelemetry.sdk.trace import TracerProvider as _tracer_provider_type
     from opentelemetry.sdk.trace.export import (
-        BatchSpanProcessor as _BatchSpanProcessor,
-        ConsoleSpanExporter as _ConsoleSpanExporter,
+        BatchSpanProcessor as _batch_span_processor_type,
+        ConsoleSpanExporter as _console_span_exporter_type,
     )
 except ModuleNotFoundError:  # pragma: no cover - executed when tracing not installed
-    _ot_trace = None
-    _OTLPSpanExporter = None
-    _FastAPIInstrumentor = None
-    _Resource = None
-    _TracerProvider = None
-    _BatchSpanProcessor = None
-    _ConsoleSpanExporter = None
+    pass
+else:
+    _trace_mod = _trace_module
+    _otlp_exporter_cls = _otlp_exporter_type
+    _fastapi_instrumentor_cls = _fastapi_instrumentor_type
+    _resource_cls = _resource_type
+    _tracer_provider_cls = _tracer_provider_type
+    _batch_span_processor_cls = _batch_span_processor_type
+    _console_span_exporter_cls = _console_span_exporter_type
 
-ot_trace: Any = _ot_trace
-OTLPSpanExporter: Any = _OTLPSpanExporter
-FastAPIInstrumentor: Any = _FastAPIInstrumentor
-Resource: Any = _Resource
-TracerProvider: Any = _TracerProvider
-BatchSpanProcessor: Any = _BatchSpanProcessor
-ConsoleSpanExporter: Any = _ConsoleSpanExporter
+ot_trace: Any = _trace_mod
+OTLPSpanExporter: Any = _otlp_exporter_cls
+FastAPIInstrumentor: Any = _fastapi_instrumentor_cls
+Resource: Any = _resource_cls
+TracerProvider: Any = _tracer_provider_cls
+BatchSpanProcessor: Any = _batch_span_processor_cls
+ConsoleSpanExporter: Any = _console_span_exporter_cls
 
 __all__ = [
     "CONNECTION_EVENTS",
