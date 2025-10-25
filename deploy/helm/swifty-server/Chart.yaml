@@ -1,0 +1,6 @@
+apiVersion: v2
+name: swifty-server
+version: 0.1.0
+appVersion: "1.0.0"
+description: Helm chart for deploying the Swifty WebSocket server with TLS termination and rate limiting.
+type: application
