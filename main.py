@@ -221,8 +221,13 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
 class RateLimitMiddleware(BaseHTTPMiddleware):
     """Apply IP-based rate limiting to HTTP requests."""
 
-    def __init__(self, app: FastAPI, rate_limiter: RateLimiter, trust_forwarded: bool) -> None:
+    def __init__(self, app: FastAPI, **kwargs: Any) -> None:
+        rate_limiter: RateLimiter = kwargs.pop("rate_limiter")
+        trust_forwarded: bool = kwargs.pop("trust_forwarded")
         super().__init__(app)
+        if kwargs:
+            unexpected = ", ".join(kwargs.keys())
+            raise TypeError(f"Unexpected arguments for RateLimitMiddleware: {unexpected}")
         self._rate_limiter = rate_limiter
         self._trust_forwarded = trust_forwarded
 
@@ -278,8 +283,12 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 class ConcurrencyLimitMiddleware(BaseHTTPMiddleware):
     """Enforce a maximum number of concurrent HTTP requests."""
 
-    def __init__(self, app: FastAPI, limiter: ConcurrencyLimiter) -> None:
+    def __init__(self, app: FastAPI, **kwargs: Any) -> None:
+        limiter: ConcurrencyLimiter = kwargs.pop("limiter")
         super().__init__(app)
+        if kwargs:
+            unexpected = ", ".join(kwargs.keys())
+            raise TypeError(f"Unexpected arguments for ConcurrencyLimitMiddleware: {unexpected}")
         self._limiter = limiter
 
     async def dispatch(self, request: Request, call_next):  # type: ignore[override]
