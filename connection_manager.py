@@ -468,7 +468,9 @@ class ConnectionManager:
         """Return background worker health information."""
 
         task = self._delivery_worker_task
-        running = bool(task) and not task.done()
+        running = False
+        if task is not None:
+            running = not task.done()
         return {
             "started": self._worker_started,
             "running": running,

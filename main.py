@@ -162,7 +162,7 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
                 status_code=status_code,
                 content={"detail": error_response(ErrorCode.VALIDATION_ERROR, "Request validation failed", exc.errors())},
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
             status_code = 500
             ERROR_COUNTER.labels(type="http_internal_error").inc()
             logger.exception(
@@ -1017,7 +1017,7 @@ async def websocket_endpoint(
                 "websocket_client_disconnected",
                 extra={"client_uuid": str(client_uuid), "client_name": client_name},
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
             ERROR_COUNTER.labels(type="websocket_error").inc()
             logger.exception(
                 "websocket_session_error",

@@ -50,7 +50,7 @@ class SwiftyClient:
             data = response.json()
             self.access_token = data.get("access_token")
             self.refresh_token = data.get("refresh_token")
-            print(f"✓ Registration successful!")
+            print("✓ Registration successful!")
             if self.access_token:
                 print(f"  Access token: {self.access_token[:50]}...")
             if self.refresh_token:
@@ -69,10 +69,10 @@ class SwiftyClient:
         ws_url = self.server_url.replace('http://', 'ws://').replace('https://', 'wss://')
         uri = f"{ws_url}/ws?token={self.access_token}"
         
-        print(f"Connecting to WebSocket...")
+        print("Connecting to WebSocket...")
         try:
             self.ws = await websockets.connect(uri)
-            print(f"✓ Connected to WebSocket!")
+            print("✓ Connected to WebSocket!")
             return True
         except Exception as e:
             print(f"✗ Connection failed: {e}")
