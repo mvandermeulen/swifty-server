@@ -13,6 +13,7 @@ from typing import Any, Optional
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from uuid import UUID, uuid4
 import json
@@ -47,15 +48,6 @@ tracer = get_tracer("swifty.main")
 
 # Load configuration
 settings = get_settings()
-
-# Create FastAPI app
-app = FastAPI(
-    title="Swifty Server",
-    description="FastAPI WebSocket Server for Real-Time Communications",
-    version="1.0.0",
-)
-
-configure_observability(app)
 
 # Configure rate limiting and throttling controls
 http_rate_limiter = RateLimiter(
@@ -319,13 +311,25 @@ class ConcurrencyLimitMiddleware(BaseHTTPMiddleware):
         return response
 
 
-app.add_middleware(ConcurrencyLimitMiddleware, limiter=http_concurrency_limiter)
-app.add_middleware(
-    RateLimitMiddleware,
-    rate_limiter=http_rate_limiter,
-    trust_forwarded=settings.http_trust_forwarded_headers,
+middleware = [
+    Middleware(ConcurrencyLimitMiddleware, limiter=http_concurrency_limiter),
+    Middleware(
+        RateLimitMiddleware,
+        rate_limiter=http_rate_limiter,
+        trust_forwarded=settings.http_trust_forwarded_headers,
+    ),
+    Middleware(RequestContextMiddleware),
+]
+
+# Create FastAPI app
+app = FastAPI(
+    title="Swifty Server",
+    description="FastAPI WebSocket Server for Real-Time Communications",
+    version="1.0.0",
+    middleware=middleware,
 )
-app.add_middleware(RequestContextMiddleware)
+
+configure_observability(app)
 
 
 def _require_admin(payload: dict) -> None:
