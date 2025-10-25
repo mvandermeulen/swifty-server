@@ -1,0 +1,311 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy Swifty Server on ECS Fargate with TLS termination and rate limiting.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Description: Environment name (dev, staging, prod)
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PublicSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+  PrivateSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+  ContainerImage:
+    Type: String
+    Description: Container image for the service
+  ContainerPort:
+    Type: Number
+    Default: 8000
+  DesiredCount:
+    Type: Number
+    Default: 2
+  MaxCount:
+    Type: Number
+    Default: 10
+  CertificateArn:
+    Type: String
+    Description: ACM certificate ARN for HTTPS
+  JwtSecret:
+    Type: String
+    NoEcho: true
+  RedisEndpoint:
+    Type: String
+  RedisPort:
+    Type: Number
+    Default: 6379
+  RedisPassword:
+    Type: String
+    Default: ''
+    NoEcho: true
+  RateLimitPerMinute:
+    Type: Number
+    Default: 600
+  RateLimitWindowSeconds:
+    Type: Number
+    Default: 60
+  HttpMaxConcurrency:
+    Type: Number
+    Default: 200
+  HttpThrottleTimeout:
+    Type: Number
+    Default: 0.25
+  WebsocketMessageRate:
+    Type: Number
+    Default: 900
+  WebsocketMessageWindow:
+    Type: Number
+    Default: 60
+  WebsocketMaxConnections:
+    Type: Number
+    Default: 4000
+  Cpu:
+    Type: Number
+    Default: 512
+  Memory:
+    Type: Number
+    Default: 1024
+  HealthCheckPath:
+    Type: String
+    Default: /health/ready
+  AllowedIngressCidr:
+    Type: String
+    Default: 0.0.0.0/0
+
+Resources:
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub swifty-${EnvironmentName}
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/ecs/swifty-${EnvironmentName}
+      RetentionInDays: 30
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow inbound HTTPS for Swifty Server
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref AllowedIngressCidr
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref AllowedIngressCidr
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: 0
+          ToPort: 0
+          CidrIp: 0.0.0.0/0
+
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow ALB to reach ECS tasks
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: 0
+          ToPort: 0
+          CidrIp: 0.0.0.0/0
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub swifty-${EnvironmentName}-alb
+      Scheme: internet-facing
+      Type: application
+      Subnets: !Ref PublicSubnets
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub swifty-${EnvironmentName}-tg
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 3
+      UnhealthyThresholdCount: 3
+      HealthCheckPath: !Ref HealthCheckPath
+      Matcher:
+        HttpCode: 200-399
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Port: '443'
+            Protocol: HTTPS
+            StatusCode: HTTP_301
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub swifty-${EnvironmentName}
+      Cpu: !Ref Cpu
+      Memory: !Ref Memory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: swifty
+          Image: !Ref ContainerImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Environment:
+            - Name: ENVIRONMENT
+              Value: !Ref EnvironmentName
+            - Name: JWT_SECRET_KEY
+              Value: !Ref JwtSecret
+            - Name: REDIS_HOST
+              Value: !Ref RedisEndpoint
+            - Name: REDIS_PORT
+              Value: !Ref RedisPort
+            - Name: HTTP_RATE_LIMIT_PER_MINUTE
+              Value: !Ref RateLimitPerMinute
+            - Name: HTTP_RATE_LIMIT_WINDOW_SECONDS
+              Value: !Ref RateLimitWindowSeconds
+            - Name: HTTP_MAX_CONCURRENT_REQUESTS
+              Value: !Ref HttpMaxConcurrency
+            - Name: HTTP_THROTTLE_TIMEOUT_SECONDS
+              Value: !Ref HttpThrottleTimeout
+            - Name: WEBSOCKET_MESSAGE_RATE
+              Value: !Ref WebsocketMessageRate
+            - Name: WEBSOCKET_MESSAGE_WINDOW_SECONDS
+              Value: !Ref WebsocketMessageWindow
+            - Name: WEBSOCKET_MAX_CONNECTIONS
+              Value: !Ref WebsocketMaxConnections
+          Secrets:
+            - !If
+              - HasRedisPassword
+              - Name: REDIS_PASSWORD
+                ValueFrom: !Ref RedisPassword
+              - !Ref AWS::NoValue
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - HttpsListener
+    Properties:
+      Cluster: !Ref Cluster
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref ServiceSecurityGroup
+          Subnets: !Ref PrivateSubnets
+      LoadBalancers:
+        - ContainerName: swifty
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroup
+      TaskDefinition: !Ref TaskDefinition
+
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !Ref MaxCount
+      MinCapacity: !Ref DesiredCount
+      ResourceId: !Sub service/${Cluster}/${Service.Name}
+      RoleARN: !GetAtt AutoScalingRole.Arn
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  AutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: application-autoscaling.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceAutoscaleRole
+
+  ScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub swifty-${EnvironmentName}-cpu
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: 60
+        ScaleInCooldown: 60
+        ScaleOutCooldown: 60
+
+Conditions:
+  HasRedisPassword: !Not [!Equals [!Ref RedisPassword, '']]
+
+Outputs:
+  LoadBalancerDNSName:
+    Description: Public DNS name for the load balancer
+    Value: !GetAtt LoadBalancer.DNSName
+  ClusterName:
+    Description: Name of the ECS cluster
+    Value: !Ref Cluster

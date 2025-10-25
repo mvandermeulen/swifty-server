@@ -35,6 +35,20 @@ def _parse_list(value: str | None, default: list[str]) -> list[str]:
     return items if items else list(default)
 
 
+def _parse_float(value: str | None, default: float) -> float:
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        logger.warning(
+            "Invalid float for configuration value '%s'; using default %s",
+            value,
+            default,
+        )
+        return default
+
+
 @dataclass
 class Settings:
     """Runtime settings loaded from environment variables."""
@@ -48,6 +62,14 @@ class Settings:
     default_client_roles: list[str] = field(default_factory=lambda: ["user"])
     admin_client_ids: list[str] = field(default_factory=list)
     redis_token_prefix: str = "token"
+    http_rate_limit_per_minute: int = 120
+    http_rate_limit_window_seconds: int = 60
+    http_max_concurrent_requests: int = 50
+    http_throttle_timeout_seconds: float = 0.25
+    http_trust_forwarded_headers: bool = True
+    websocket_message_rate: int = 240
+    websocket_message_window_seconds: int = 60
+    websocket_max_connections: int = 1000
 
 
 def _load_secret_from_file(path: str | None) -> str | None:
@@ -94,6 +116,14 @@ def load_settings() -> Settings:
         admin_ids = _parse_list(admin_ids_env, [])
 
     redis_token_prefix = os.getenv("REDIS_TOKEN_PREFIX", "token")
+    http_rate_limit_per_minute = _parse_int(os.getenv("HTTP_RATE_LIMIT_PER_MINUTE"), 120)
+    http_rate_limit_window_seconds = _parse_int(os.getenv("HTTP_RATE_LIMIT_WINDOW_SECONDS"), 60)
+    http_max_concurrent_requests = _parse_int(os.getenv("HTTP_MAX_CONCURRENT_REQUESTS"), 50)
+    http_throttle_timeout_seconds = _parse_float(os.getenv("HTTP_THROTTLE_TIMEOUT_SECONDS"), 0.25)
+    http_trust_forwarded_headers = _parse_bool(os.getenv("HTTP_TRUST_FORWARDED_HEADERS"), True)
+    websocket_message_rate = _parse_int(os.getenv("WEBSOCKET_MESSAGE_RATE"), 240)
+    websocket_message_window_seconds = _parse_int(os.getenv("WEBSOCKET_MESSAGE_WINDOW_SECONDS"), 60)
+    websocket_max_connections = _parse_int(os.getenv("WEBSOCKET_MAX_CONNECTIONS"), 1000)
 
     return Settings(
         jwt_secret_key=secret_key,
@@ -105,6 +135,14 @@ def load_settings() -> Settings:
         default_client_roles=default_roles,
         admin_client_ids=admin_ids,
         redis_token_prefix=redis_token_prefix,
+        http_rate_limit_per_minute=http_rate_limit_per_minute,
+        http_rate_limit_window_seconds=http_rate_limit_window_seconds,
+        http_max_concurrent_requests=http_max_concurrent_requests,
+        http_throttle_timeout_seconds=http_throttle_timeout_seconds,
+        http_trust_forwarded_headers=http_trust_forwarded_headers,
+        websocket_message_rate=websocket_message_rate,
+        websocket_message_window_seconds=websocket_message_window_seconds,
+        websocket_max_connections=websocket_max_connections,
     )
 
 

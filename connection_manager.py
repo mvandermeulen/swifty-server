@@ -22,6 +22,10 @@ logger = logging.getLogger(__name__)
 tracer = get_tracer("swifty.connection_manager")
 
 
+class ConnectionLimitError(Exception):
+    """Raised when the connection manager cannot accept additional clients."""
+
+
 @dataclass
 class PendingDelivery:
     """State for messages awaiting acknowledgment."""
@@ -44,8 +48,8 @@ class DeliveryResult:
 
 class ConnectionManager:
     """Manages WebSocket connections for all clients."""
-    
-    def __init__(self):
+
+    def __init__(self, max_connections: int | None = None):
         # Dictionary mapping client UUID to WebSocket connection (in-memory)
         self.active_connections: dict[str, WebSocket] = {}
         # Fallback dictionary for client names (when Redis is unavailable)
@@ -58,7 +62,15 @@ class ConnectionManager:
         self._ack_timeout_seconds = 10
         self._base_backoff_seconds = 2
         self._max_backoff_seconds = 60
-    
+        self._max_connections = max_connections if max_connections and max_connections > 0 else None
+        self._connection_lock = asyncio.Lock()
+
+    def set_max_connections(self, limit: int | None) -> None:
+        if limit and limit > 0:
+            self._max_connections = limit
+        else:
+            self._max_connections = None
+
     async def connect(self, websocket: WebSocket, client_uuid: UUID, client_name: str):
         """
         Accept a new WebSocket connection and register the client.
@@ -76,9 +88,18 @@ class ConnectionManager:
                 "client.name": client_name,
             },
         ):
-            await websocket.accept()
-            self.active_connections[client_uuid_str] = websocket
-            self.client_names[client_uuid_str] = client_name
+            async with self._connection_lock:
+                if (
+                    self._max_connections is not None
+                    and len(self.active_connections) >= self._max_connections
+                ):
+                    raise ConnectionLimitError(
+                        f"maximum connections reached ({self._max_connections})"
+                    )
+
+                await websocket.accept()
+                self.active_connections[client_uuid_str] = websocket
+                self.client_names[client_uuid_str] = client_name
 
             # Store in Redis
             try:

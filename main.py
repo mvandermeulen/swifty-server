@@ -13,12 +13,14 @@ from typing import Any, Optional
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from uuid import UUID, uuid4
 import json
 import time
 import logging
 
+from config import get_settings
 from models import (
     ClientRegistration,
     Message,
@@ -36,24 +38,35 @@ from auth import (
     revoke_token,
     revoke_client_tokens,
 )
-from connection_manager import ConnectionManager
+from connection_manager import ConnectionLimitError, ConnectionManager
 from observability import ERROR_COUNTER, MESSAGE_COUNTER, configure_observability, get_tracer
 from redis_store import RedisOperationError, RedisUnavailableError, redis_store
+from throttling import ConcurrencyLimiter, RateLimiter
 
 logger = logging.getLogger(__name__)
 tracer = get_tracer("swifty.main")
 
-# Create FastAPI app
-app = FastAPI(
-    title="Swifty Server",
-    description="FastAPI WebSocket Server for Real-Time Communications",
-    version="1.0.0",
+# Load configuration
+settings = get_settings()
+
+# Configure rate limiting and throttling controls
+http_rate_limiter = RateLimiter(
+    settings.http_rate_limit_per_minute,
+    settings.http_rate_limit_window_seconds,
+    prefix="http",
+)
+http_concurrency_limiter = ConcurrencyLimiter(
+    settings.http_max_concurrent_requests,
+    settings.http_throttle_timeout_seconds,
+)
+websocket_message_limiter = RateLimiter(
+    settings.websocket_message_rate,
+    settings.websocket_message_window_seconds,
+    prefix="wsmsg",
 )
 
-configure_observability(app)
-
 # Create connection manager
-manager = ConnectionManager()
+manager = ConnectionManager(settings.websocket_max_connections)
 
 
 class ErrorCode(str, Enum):
@@ -84,6 +97,10 @@ class ErrorCode(str, Enum):
     NOT_SUBSCRIBED_TO_TOPIC = "NOT_SUBSCRIBED_TO_TOPIC"
     INVALID_MESSAGE_FORMAT = "INVALID_MESSAGE_FORMAT"
     MESSAGE_SENDER_MISMATCH = "MESSAGE_SENDER_MISMATCH"
+    RATE_LIMIT_EXCEEDED = "RATE_LIMIT_EXCEEDED"
+    TOO_MANY_CONCURRENT_REQUESTS = "TOO_MANY_CONCURRENT_REQUESTS"
+    WEBSOCKET_RATE_LIMIT_EXCEEDED = "WEBSOCKET_RATE_LIMIT_EXCEEDED"
+    WEBSOCKET_CAPACITY_REACHED = "WEBSOCKET_CAPACITY_REACHED"
 
 
 def error_response(code: ErrorCode, message: str, details: Optional[Any] = None) -> dict[str, Any]:
@@ -193,7 +210,126 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         return response
 
 
-app.add_middleware(RequestContextMiddleware)
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    """Apply IP-based rate limiting to HTTP requests."""
+
+    def __init__(self, app: FastAPI, **kwargs: Any) -> None:
+        rate_limiter: RateLimiter = kwargs.pop("rate_limiter")
+        trust_forwarded: bool = kwargs.pop("trust_forwarded")
+        super().__init__(app)
+        if kwargs:
+            unexpected = ", ".join(kwargs.keys())
+            raise TypeError(f"Unexpected arguments for RateLimitMiddleware: {unexpected}")
+        self._rate_limiter = rate_limiter
+        self._trust_forwarded = trust_forwarded
+
+    def _resolve_identifier(self, request: Request) -> str:
+        if self._trust_forwarded:
+            forwarded = request.headers.get("x-forwarded-for") or request.headers.get(
+                "X-Forwarded-For"
+            )
+            if forwarded:
+                return forwarded.split(",")[0].strip()
+        if request.client:
+            return request.client.host
+        return "unknown"
+
+    async def dispatch(self, request: Request, call_next):  # type: ignore[override]
+        if not self._rate_limiter.enabled:
+            return await call_next(request)
+
+        identifier = self._resolve_identifier(request)
+        status = await self._rate_limiter.check(identifier)
+
+        headers = {
+            "X-RateLimit-Limit": str(self._rate_limiter.limit),
+            "X-RateLimit-Remaining": str(max(status.remaining, 0)),
+            "X-RateLimit-Window": str(self._rate_limiter.window),
+        }
+
+        if not status.allowed:
+            retry_after = max(int(status.reset_after), 1)
+            headers["Retry-After"] = str(retry_after)
+            ERROR_COUNTER.labels(type="http_rate_limit").inc()
+            return JSONResponse(
+                status_code=429,
+                content=error_response(
+                    ErrorCode.RATE_LIMIT_EXCEEDED,
+                    "Rate limit exceeded",
+                    details={
+                        "identifier": identifier,
+                        "retry_after_seconds": status.reset_after,
+                    },
+                ),
+                headers=headers,
+            )
+
+        response = await call_next(request)
+        reset_time = int(time.time() + status.reset_after)
+        headers["X-RateLimit-Reset"] = str(reset_time)
+        for key, value in headers.items():
+            response.headers[key] = value
+        return response
+
+
+class ConcurrencyLimitMiddleware(BaseHTTPMiddleware):
+    """Enforce a maximum number of concurrent HTTP requests."""
+
+    def __init__(self, app: FastAPI, **kwargs: Any) -> None:
+        limiter: ConcurrencyLimiter = kwargs.pop("limiter")
+        super().__init__(app)
+        if kwargs:
+            unexpected = ", ".join(kwargs.keys())
+            raise TypeError(f"Unexpected arguments for ConcurrencyLimitMiddleware: {unexpected}")
+        self._limiter = limiter
+
+    async def dispatch(self, request: Request, call_next):  # type: ignore[override]
+        if not self._limiter.enabled:
+            return await call_next(request)
+
+        acquired = await self._limiter.acquire()
+        if not acquired:
+            ERROR_COUNTER.labels(type="http_concurrency").inc()
+            return JSONResponse(
+                status_code=503,
+                content=error_response(
+                    ErrorCode.TOO_MANY_CONCURRENT_REQUESTS,
+                    "Request throttled due to high load",
+                    details={
+                        "limit": self._limiter.limit,
+                        "timeout_seconds": self._limiter.timeout,
+                    },
+                ),
+                headers={"Retry-After": str(max(int(self._limiter.timeout), 1))},
+            )
+
+        try:
+            response = await call_next(request)
+        finally:
+            self._limiter.release()
+
+        return response
+
+
+middleware = [
+    Middleware(ConcurrencyLimitMiddleware, limiter=http_concurrency_limiter),
+    Middleware(
+        RateLimitMiddleware,
+        rate_limiter=http_rate_limiter,
+        trust_forwarded=settings.http_trust_forwarded_headers,
+    ),
+    Middleware(RequestContextMiddleware),
+]
+
+# Create FastAPI app
+app = FastAPI(
+    title="Swifty Server",
+    description="FastAPI WebSocket Server for Real-Time Communications",
+    version="1.0.0",
+    middleware=middleware,
+)
+
+configure_observability(app)
 
 
 def _require_admin(payload: dict) -> None:
@@ -767,7 +903,22 @@ async def websocket_endpoint(
     }
 
     with tracer.start_as_current_span("websocket.session", attributes=session_attributes):
-        await manager.connect(websocket, client_uuid, client_name)
+        try:
+            await manager.connect(websocket, client_uuid, client_name)
+        except ConnectionLimitError as exc:
+            await websocket.accept()
+            ERROR_COUNTER.labels(type="websocket_capacity").inc()
+            await websocket.send_json(
+                websocket_error_frame(
+                    ErrorCode.WEBSOCKET_CAPACITY_REACHED,
+                    "Server capacity reached",
+                    "Retry after demand subsides or connect to an alternate region.",
+                    details={"limit": settings.websocket_max_connections, "error": str(exc)},
+                )
+            )
+            await websocket.close(code=1013, reason="Server overloaded")
+            return
+
         logger.info(
             "websocket_client_connected",
             extra={"client_uuid": str(client_uuid), "client_name": client_name},
@@ -787,6 +938,21 @@ async def websocket_endpoint(
             while True:
                 data = await websocket.receive_text()
                 MESSAGE_COUNTER.labels(direction="inbound", channel="websocket").inc()
+
+                rate_status = await websocket_message_limiter.check(str(client_uuid))
+                if not rate_status.allowed:
+                    ERROR_COUNTER.labels(type="websocket_rate_limit").inc()
+                    await send_payload(
+                        websocket_error_frame(
+                            ErrorCode.WEBSOCKET_RATE_LIMIT_EXCEEDED,
+                            "Message rate limit exceeded",
+                            "Slow down message publishing and retry after the cooldown period.",
+                            details={"retry_after_seconds": rate_status.reset_after},
+                        )
+                    )
+                    manager.disconnect(client_uuid)
+                    await websocket.close(code=1013, reason="Message rate limit exceeded")
+                    break
 
                 with tracer.start_as_current_span(
                     "websocket.message",
