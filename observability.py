@@ -36,9 +36,9 @@ except ModuleNotFoundError:  # pragma: no cover - executed when prometheus not i
     def _generate_latest() -> bytes:
         return b""
 
-    Counter = _counter  # type: ignore[assignment]
-    Gauge = _gauge  # type: ignore[assignment]
-    generate_latest = _generate_latest  # type: ignore[assignment]
+    Counter = _counter  # type: ignore[misc]
+    Gauge = _gauge  # type: ignore[misc]
+    generate_latest = _generate_latest  # type: ignore[misc]
 
 try:  # pragma: no cover - optional dependency
     from opentelemetry import trace as _imported_ot_trace
